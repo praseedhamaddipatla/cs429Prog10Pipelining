@@ -1,6 +1,17 @@
 // tinker.sv — tinker cpu core (ooo, dual-issue)
 // optimizations: forwarding, multi-issue, ooo, pipelined fu, ls queue,
 //   deeper pipeline, branch prediction, register renaming
+//
+// BUG FIXES:
+//  1. prf[0..31] now mirrors reg_file.registers[] every cycle so that
+//     testbench-loaded initial register state is visible to the OOO engine.
+//  2. call: waddr=rd (not r31), also dispatches a stack-store to the LSQ.
+//  3. return: raddr1=r31 in decoder; dispatch to LSQ as a load, loaded
+//     value becomes the jump target (not a register write).
+//  4. ALU side-channel pipeline regs extended to carry all info needed
+//     for branch/jump/call/return resolution.
+//  5. subi immediate now sign-extended (was already in decoder; fixed
+//     pipeline to properly pass the signed immediate through).
 
 `define MEM_SIZE (512 * 1024)
 `define PC_START 64'h2000
@@ -21,82 +32,83 @@ module tinker_core (
   // ---------------------------------------------------------------------------
   // PARAMETERS
   // ---------------------------------------------------------------------------
-  localparam NPHYS = 64;
-  localparam PHYS_W = 6;
+  localparam NPHYS    = 64;
+  localparam PHYS_W   = 6;
   localparam ROB_SIZE = 32;
   localparam ROB_BITS = 5;
-  localparam RS_INT = 8;
-  localparam RS_FP = 4;
+  localparam RS_INT   = 8;
+  localparam RS_FP    = 4;
   localparam LSQ_SIZE = 8;
 
   // ---------------------------------------------------------------------------
   // PHYSICAL REGISTER FILE + READY BITS
   // ---------------------------------------------------------------------------
-  reg [      63:0] prf      [0:NPHYS-1];
-  reg              prf_rdy  [0:NPHYS-1];
+  reg [63:0] prf     [0:NPHYS-1];
+  reg        prf_rdy [0:NPHYS-1];
 
   // ---------------------------------------------------------------------------
   // ARCHITECTURAL REGISTER FILE (commit-only writes)
   // ---------------------------------------------------------------------------
-  reg [      63:0] arch_rf  [     0:31];
+  reg [63:0] arch_rf [0:31];
 
   // ---------------------------------------------------------------------------
   // REGISTER ALIAS TABLE + FREE LIST
   // ---------------------------------------------------------------------------
-  reg [PHYS_W-1:0] rat_map  [     0:31];
+  reg [PHYS_W-1:0] rat_map  [0:31];
   reg [PHYS_W-1:0] free_list[0:NPHYS-1];
   reg [5:0] fl_head, fl_tail;
-  reg [       6:0] fl_cnt;  // 0..64
+  reg [6:0] fl_cnt;
 
   // ---------------------------------------------------------------------------
   // REORDER BUFFER
   // ---------------------------------------------------------------------------
-  reg              rob_valid        [0:ROB_SIZE-1];
-  reg              rob_done         [0:ROB_SIZE-1];
-  reg [       4:0] rob_arch         [0:ROB_SIZE-1];
-  reg [PHYS_W-1:0] rob_phys         [0:ROB_SIZE-1];
-  reg [PHYS_W-1:0] rob_old          [0:ROB_SIZE-1];
-  reg [      63:0] rob_result       [0:ROB_SIZE-1];
-  reg              rob_has_dest     [0:ROB_SIZE-1];
-  reg              rob_is_store     [0:ROB_SIZE-1];
-  reg              rob_is_halt      [0:ROB_SIZE-1];
-  reg              rob_is_branch    [0:ROB_SIZE-1];
-  reg              rob_is_jump      [0:ROB_SIZE-1];
-  reg [      63:0] rob_pc           [0:ROB_SIZE-1];
-  reg              rob_pred_taken   [0:ROB_SIZE-1];
-  reg [      63:0] rob_pred_tgt     [0:ROB_SIZE-1];
-  reg              rob_act_taken    [0:ROB_SIZE-1];
-  reg [      63:0] rob_act_tgt      [0:ROB_SIZE-1];
+  reg              rob_valid      [0:ROB_SIZE-1];
+  reg              rob_done       [0:ROB_SIZE-1];
+  reg [4:0]        rob_arch       [0:ROB_SIZE-1];
+  reg [PHYS_W-1:0] rob_phys       [0:ROB_SIZE-1];
+  reg [PHYS_W-1:0] rob_old        [0:ROB_SIZE-1];
+  reg [63:0]       rob_result     [0:ROB_SIZE-1];
+  reg              rob_has_dest   [0:ROB_SIZE-1];
+  reg              rob_is_store   [0:ROB_SIZE-1];
+  reg              rob_is_halt    [0:ROB_SIZE-1];
+  reg              rob_is_branch  [0:ROB_SIZE-1];
+  reg              rob_is_jump    [0:ROB_SIZE-1];
+  reg [63:0]       rob_pc         [0:ROB_SIZE-1];
+  reg              rob_pred_taken [0:ROB_SIZE-1];
+  reg [63:0]       rob_pred_tgt   [0:ROB_SIZE-1];
+  reg              rob_act_taken  [0:ROB_SIZE-1];
+  reg [63:0]       rob_act_tgt    [0:ROB_SIZE-1];
 
   reg [ROB_BITS-1:0] rob_head, rob_tail;
-  reg [ROB_BITS:0] rob_cnt;
-
+  reg [ROB_BITS:0]   rob_cnt;
   wire rob_full = (rob_cnt >= ROB_SIZE - 2);
 
   // ---------------------------------------------------------------------------
   // INT RESERVATION STATIONS
   // ---------------------------------------------------------------------------
-  reg rs_v[0:RS_INT-1];
-  reg [4:0] rs_op[0:RS_INT-1];
-  reg [PHYS_W-1:0] rs_ps[0:RS_INT-1];
-  reg [PHYS_W-1:0] rs_pt[0:RS_INT-1];
-  reg rs_psrdy[0:RS_INT-1];
-  reg rs_ptrdy[0:RS_INT-1];
-  reg [63:0] rs_vs[0:RS_INT-1];
-  reg [63:0] rs_vt[0:RS_INT-1];
-  reg [63:0] rs_imm[0:RS_INT-1];
-  reg rs_uimm[0:RS_INT-1];
-  reg [ROB_BITS-1:0] rs_rob[0:RS_INT-1];
-  reg [63:0] rs_pc[0:RS_INT-1];
-  reg rs_ibr[0:RS_INT-1];
-  reg rs_ibgt[0:RS_INT-1];
-  reg rs_ijmp[0:RS_INT-1];
-  reg rs_ibrreg[0:RS_INT-1];
-  reg rs_ibrimm[0:RS_INT-1];
-  reg rs_imovr[0:RS_INT-1];
-  reg rs_imovi[0:RS_INT-1];
-  reg rs_ptaken[0:RS_INT-1];
-  reg [63:0] rs_ptgt[0:RS_INT-1];
+  reg              rs_v      [0:RS_INT-1];
+  reg [4:0]        rs_op     [0:RS_INT-1];
+  reg [PHYS_W-1:0] rs_ps     [0:RS_INT-1];
+  reg [PHYS_W-1:0] rs_pt     [0:RS_INT-1];
+  reg              rs_psrdy  [0:RS_INT-1];
+  reg              rs_ptrdy  [0:RS_INT-1];
+  reg [63:0]       rs_vs     [0:RS_INT-1];
+  reg [63:0]       rs_vt     [0:RS_INT-1];
+  reg [63:0]       rs_imm    [0:RS_INT-1];
+  reg              rs_uimm   [0:RS_INT-1];
+  reg [ROB_BITS-1:0] rs_rob  [0:RS_INT-1];
+  reg [63:0]       rs_pc     [0:RS_INT-1];
+  reg              rs_ibr    [0:RS_INT-1];
+  reg              rs_ibgt   [0:RS_INT-1];
+  reg              rs_ijmp   [0:RS_INT-1];
+  reg              rs_ibrreg [0:RS_INT-1];
+  reg              rs_ibrimm [0:RS_INT-1];
+  reg              rs_imovr  [0:RS_INT-1];
+  reg              rs_imovi  [0:RS_INT-1];
+  reg              rs_ical   [0:RS_INT-1];
+  reg              rs_iret   [0:RS_INT-1];
+  reg              rs_ptaken [0:RS_INT-1];
+  reg [63:0]       rs_ptgt   [0:RS_INT-1];
 
   reg [3:0] rs_cnt;
   wire rs_full = (rs_cnt >= RS_INT - 1);
@@ -104,15 +116,15 @@ module tinker_core (
   // ---------------------------------------------------------------------------
   // FP RESERVATION STATIONS
   // ---------------------------------------------------------------------------
-  reg fp_v[0:RS_FP-1];
-  reg [4:0] fp_op[0:RS_FP-1];
-  reg [PHYS_W-1:0] fp_ps[0:RS_FP-1];
-  reg [PHYS_W-1:0] fp_pt[0:RS_FP-1];
-  reg fp_psrdy[0:RS_FP-1];
-  reg fp_ptrdy[0:RS_FP-1];
-  reg [63:0] fp_vs[0:RS_FP-1];
-  reg [63:0] fp_vt[0:RS_FP-1];
-  reg [ROB_BITS-1:0] fp_rob[0:RS_FP-1];
+  reg              fp_v     [0:RS_FP-1];
+  reg [4:0]        fp_op    [0:RS_FP-1];
+  reg [PHYS_W-1:0] fp_ps    [0:RS_FP-1];
+  reg [PHYS_W-1:0] fp_pt    [0:RS_FP-1];
+  reg              fp_psrdy [0:RS_FP-1];
+  reg              fp_ptrdy [0:RS_FP-1];
+  reg [63:0]       fp_vs    [0:RS_FP-1];
+  reg [63:0]       fp_vt    [0:RS_FP-1];
+  reg [ROB_BITS-1:0] fp_rob [0:RS_FP-1];
 
   reg [2:0] fp_cnt;
   wire fp_full = (fp_cnt >= RS_FP - 1);
@@ -120,102 +132,107 @@ module tinker_core (
   // ---------------------------------------------------------------------------
   // LOAD/STORE QUEUE
   // ---------------------------------------------------------------------------
-  reg lsq_v[0:LSQ_SIZE-1];
-  reg lsq_ld[0:LSQ_SIZE-1];
-  reg lsq_st[0:LSQ_SIZE-1];
-  reg lsq_ardy[0:LSQ_SIZE-1];
-  reg lsq_drdy[0:LSQ_SIZE-1];
-  reg lsq_cmt[0:LSQ_SIZE-1];
-  reg [63:0] lsq_base[0:LSQ_SIZE-1];
-  reg [63:0] lsq_data[0:LSQ_SIZE-1];
-  reg [63:0] lsq_imm[0:LSQ_SIZE-1];
-  reg [PHYS_W-1:0] lsq_ps[0:LSQ_SIZE-1];
-  reg [PHYS_W-1:0] lsq_pt[0:LSQ_SIZE-1];
-  reg [PHYS_W-1:0] lsq_pd[0:LSQ_SIZE-1];
+  reg              lsq_v    [0:LSQ_SIZE-1];
+  reg              lsq_ld   [0:LSQ_SIZE-1];
+  reg              lsq_st   [0:LSQ_SIZE-1];
+  reg              lsq_ardy [0:LSQ_SIZE-1];
+  reg              lsq_drdy [0:LSQ_SIZE-1];
+  reg              lsq_cmt  [0:LSQ_SIZE-1];
+  reg [63:0]       lsq_base [0:LSQ_SIZE-1];
+  reg [63:0]       lsq_data [0:LSQ_SIZE-1];
+  reg [63:0]       lsq_imm  [0:LSQ_SIZE-1];
+  reg [PHYS_W-1:0] lsq_ps   [0:LSQ_SIZE-1];
+  reg [PHYS_W-1:0] lsq_pt   [0:LSQ_SIZE-1];
+  reg [PHYS_W-1:0] lsq_pd   [0:LSQ_SIZE-1];
   reg [ROB_BITS-1:0] lsq_rob[0:LSQ_SIZE-1];
+  // is_ret flag: this LSQ entry's loaded value becomes the PC (return instruction)
+  reg              lsq_isret[0:LSQ_SIZE-1];
 
   reg [3:0] lsq_head, lsq_tail;
   reg [4:0] lsq_cnt;
-  wire lsq_full = (lsq_cnt >= LSQ_SIZE - 1);
+  wire lsq_full = (lsq_cnt >= LSQ_SIZE - 2);  // -2 because call uses 2 LSQ slots
 
   // ---------------------------------------------------------------------------
   // DECODE QUEUE
   // ---------------------------------------------------------------------------
-  reg dq_v0, dq_v1;
+  reg        dq_v0, dq_v1;
   reg [31:0] dq_i0, dq_i1;
   reg [63:0] dq_pc0, dq_pc1;
 
   // ---------------------------------------------------------------------------
   // DECODER OUTPUTS (combinational)
   // ---------------------------------------------------------------------------
-  wire [4:0] d0_rs, d0_rt, d0_rd, d0_rtx;
+  wire [4:0]  d0_rs, d0_rt, d0_rd, d0_rtx;
   wire [63:0] d0_imm;
-  wire [ 4:0] d0_op;
-  wire d0_uimm,d0_wr,d0_ld,d0_st,d0_br,d0_brgt,d0_jmp,d0_brrr,d0_brri,d0_ret,d0_call,d0_hlt,d0_mvr,d0_mvi;
-  wire d0_fp = (d0_op >= 5'd10 && d0_op <= 5'd13);
+  wire [4:0]  d0_op;
+  wire d0_uimm, d0_wr, d0_ld, d0_st, d0_br, d0_brgt, d0_jmp;
+  wire d0_brrr, d0_brri, d0_ret, d0_call, d0_hlt, d0_mvr, d0_mvi;
+  wire d0_fp  = (d0_op >= 5'd10 && d0_op <= 5'd13);
   wire d0_mem = d0_ld || d0_st;
 
-  wire [4:0] d1_rs, d1_rt, d1_rd, d1_rtx;
+  wire [4:0]  d1_rs, d1_rt, d1_rd, d1_rtx;
   wire [63:0] d1_imm;
-  wire [ 4:0] d1_op;
-  wire d1_uimm,d1_wr,d1_ld,d1_st,d1_br,d1_brgt,d1_jmp,d1_brrr,d1_brri,d1_ret,d1_call,d1_hlt,d1_mvr,d1_mvi;
-  wire       d1_fp = (d1_op >= 5'd10 && d1_op <= 5'd13);
-  wire       d1_mem = d1_ld || d1_st;
+  wire [4:0]  d1_op;
+  wire d1_uimm, d1_wr, d1_ld, d1_st, d1_br, d1_brgt, d1_jmp;
+  wire d1_brrr, d1_brri, d1_ret, d1_call, d1_hlt, d1_mvr, d1_mvi;
+  wire d1_fp  = (d1_op >= 5'd10 && d1_op <= 5'd13);
+  wire d1_mem = d1_ld || d1_st;
 
   // ---------------------------------------------------------------------------
   // STALL / DISPATCH ENABLES
   // ---------------------------------------------------------------------------
-  wire       stall = rob_full || rs_full || fp_full || lsq_full;
-  wire       d0_en = dq_v0 && !stall;
-  wire       d1_en = dq_v1 && !stall && !d0_hlt;
+  wire stall = rob_full || rs_full || fp_full || lsq_full;
+  wire d0_en = dq_v0 && !stall;
+  wire d1_en = dq_v1 && !stall && !d0_hlt;
 
   // ---------------------------------------------------------------------------
   // FUNCTIONAL UNIT ISSUE REGISTERS
-  // alu_rtag / fpu_rtag are 6 bits to match the alu/fpu rob_tag_in port width
   // ---------------------------------------------------------------------------
   reg        alu_en;
-  reg  [4:0] alu_op;
+  reg [4:0]  alu_op;
   reg [63:0] alu_a, alu_b;
-  reg [5:0] alu_rtag;
+  reg [5:0]  alu_rtag;
   reg [PHYS_W-1:0] alu_pd;
 
   reg [63:0] alu_vs_p, alu_pc_p;
-  reg alu_ibr_p, alu_ibgt_p, alu_ijmp_p, alu_ibrreg_p, alu_ibrimm_p;
-  reg alu_imovr_p, alu_imovi_p;
+  reg        alu_ibr_p, alu_ibgt_p, alu_ijmp_p;
+  reg        alu_ibrreg_p, alu_ibrimm_p;
+  reg        alu_imovr_p, alu_imovi_p;
+  reg        alu_ical_p, alu_iret_p;
   reg        alu_ptaken_p;
   reg [63:0] alu_ptgt_p;
 
   reg        fpu_en;
-  reg [ 4:0] fpu_op;
+  reg [4:0]  fpu_op;
   reg [63:0] fpu_a, fpu_b;
-  reg  [       5:0] fpu_rtag;
-  reg  [PHYS_W-1:0] fpu_pd;
+  reg [5:0]  fpu_rtag;
+  reg [PHYS_W-1:0] fpu_pd;
 
-  reg  [PHYS_W-1:0] fp_pd_p                        [0:2];
+  reg [PHYS_W-1:0] fp_pd_p [0:2];
 
   // ---------------------------------------------------------------------------
   // ALU / FPU WIRES
   // ---------------------------------------------------------------------------
-  wire              alu_vout;
-  wire [      63:0] alu_res;
-  wire [       5:0] alu_tout;
+  wire        alu_vout;
+  wire [63:0] alu_res;
+  wire [5:0]  alu_tout;
 
-  wire              fpu_vout;
-  wire [      63:0] fpu_res;
-  wire [       5:0] fpu_tout;
+  wire        fpu_vout;
+  wire [63:0] fpu_res;
+  wire [5:0]  fpu_tout;
 
-  wire              fpu_is_add = (fpu_op == 5'd10);
-  wire              fpu_is_sub = (fpu_op == 5'd11);
-  wire              fpu_is_mul = (fpu_op == 5'd12);
-  wire              fpu_is_div = (fpu_op == 5'd13);
+  wire fpu_is_add = (fpu_op == 5'd10);
+  wire fpu_is_sub = (fpu_op == 5'd11);
+  wire fpu_is_mul = (fpu_op == 5'd12);
+  wire fpu_is_div = (fpu_op == 5'd13);
 
-  reg  [       2:0] fpu_sel;
+  reg [2:0] fpu_sel;
   always @(*) begin
-    if (fpu_is_add) fpu_sel = 3'd0;
+    if      (fpu_is_add) fpu_sel = 3'd0;
     else if (fpu_is_sub) fpu_sel = 3'd1;
     else if (fpu_is_mul) fpu_sel = 3'd2;
     else if (fpu_is_div) fpu_sel = 3'd3;
-    else fpu_sel = 3'd0;
+    else                 fpu_sel = 3'd0;
   end
 
   // ---------------------------------------------------------------------------
@@ -278,7 +295,7 @@ module tinker_core (
   // REG_FILE  (instance name "reg_file" required by autograder)
   // ---------------------------------------------------------------------------
   reg [63:0] rf_commit_data;
-  reg [ 4:0] rf_commit_waddr;
+  reg [4:0]  rf_commit_waddr;
   reg        rf_commit_wen;
 
   reg_file reg_file (
@@ -349,44 +366,75 @@ module tinker_core (
   // ---------------------------------------------------------------------------
   // CDB WIRES
   // ---------------------------------------------------------------------------
-  // cdb0: int alu result
-  wire                c0en = alu_vout;
-  wire [  PHYS_W-1:0] c0pd;
-  wire [        63:0] c0val;
+  // cdb0: int alu result (1-cycle delay)
+  wire                c0en  = alu_vout;
+  wire [PHYS_W-1:0]   c0pd;
+  wire [63:0]         c0val;
   wire [ROB_BITS-1:0] c0rob = alu_tout[ROB_BITS-1:0];
 
-  reg  [  PHYS_W-1:0] alu_pd_p1;
-  reg  [        63:0] alu_vs_p1;
-  reg alu_imovr_p1, alu_imovi_p1;
+  // 1-cycle side-channel pipeline registers
+  reg [PHYS_W-1:0] alu_pd_p1;
+  reg [63:0]       alu_vs_p1;     // a value fed to ALU (src reg / call target)
+  reg [63:0]       alu_b_p1;      // b value fed to ALU (imm / src-b)
+  reg [63:0]       alu_pc_p1;     // PC of the issuing instruction
+  reg              alu_imovr_p1, alu_imovi_p1;
+  reg              alu_ical_p1,  alu_iret_p1;
+  reg              alu_ibr_p1,   alu_ijmp_p1;
+  reg              alu_ibrreg_p1, alu_ibrimm_p1;
 
   always @(posedge clk) begin
-    alu_pd_p1    <= alu_pd;
-    alu_vs_p1    <= alu_a;
-    alu_imovr_p1 <= alu_imovr_p;
-    alu_imovi_p1 <= alu_imovi_p;
+    alu_pd_p1     <= alu_pd;
+    alu_vs_p1     <= alu_a;
+    alu_b_p1      <= alu_b;
+    alu_pc_p1     <= alu_pc_p;
+    alu_imovr_p1  <= alu_imovr_p;
+    alu_imovi_p1  <= alu_imovi_p;
+    alu_ical_p1   <= alu_ical_p;
+    alu_iret_p1   <= alu_iret_p;
+    alu_ibr_p1    <= alu_ibr_p;
+    alu_ijmp_p1   <= alu_ijmp_p;
+    alu_ibrreg_p1 <= alu_ibrreg_p;
+    alu_ibrimm_p1 <= alu_ibrimm_p;
   end
 
+  // CDB0 result value:
+  //   mov_reg → forward src unchanged
+  //   call    → pc+4 (return address into link register = rd)
+  //   others  → ALU computed result
   assign c0pd  = alu_pd_p1;
-  assign c0val = alu_imovr_p1 ? alu_vs_p1 : alu_res;
+  assign c0val = alu_imovr_p1 ? alu_vs_p1
+               : alu_ical_p1  ? (alu_pc_p1 + 64'd4)
+               : alu_res;
 
-  wire alu_act_taken = alu_imovr_p1 ? 1'b0 : alu_ibr_p ? alu_res[0] : alu_ijmp_p ? 1'b1 : 1'b0;
-  wire [63:0] alu_act_tgt = alu_ibrimm_p ? (alu_pc_p + alu_b)
-                           : alu_ibrreg_p ? (alu_pc_p + alu_vs_p)
-                           : alu_vs_p;
+  // Actual branch/jump outcome
+  wire alu_act_taken_w =
+      alu_ibr_p1  ? alu_res[0]   // brnz/brgt: result = 0 or 1
+    : alu_ijmp_p1 ? 1'b1         // unconditional jump always taken
+    : 1'b0;
 
-  // cdb1: fp (unified fpu output) or load
-  // NOTE: fp_pd tracks the physical dest through the 3-cycle fpu pipeline
+  // Actual jump target:
+  //   brr_imm : pc + imm (b holds imm)
+  //   brr_reg : pc + rs  (a holds rs)
+  //   call    : original rd value (a holds rd; after writing pc+4 the jump uses old rd)
+  //   return  : loaded from memory — NOT known here; handled separately via LSQ
+  //   br abs  : rs value (a holds rs)
+  wire [63:0] alu_act_tgt_w =
+      alu_ibrimm_p1 ? (alu_pc_p1 + alu_b_p1)
+    : alu_ibrreg_p1 ? (alu_pc_p1 + alu_vs_p1)
+    : alu_vs_p1;  // br / call — absolute address in src reg
+
+  // cdb1: fp result or load result
   wire [PHYS_W-1:0] fp_pd = fp_pd_p[2];
 
-  reg ld_done;
+  reg              ld_done;
   reg [PHYS_W-1:0] ld_pd;
-  reg [63:0] ld_val;
+  reg [63:0]       ld_val;
   reg [ROB_BITS-1:0] ld_rtag;
+  reg              ld_isret;       // this load is a "return" — result becomes PC redirect
 
-  // ld_done takes priority over fpu_vout on the same cycle (both rare)
-  wire c1en = ld_done || fpu_vout;
-  wire [PHYS_W-1:0] c1pd = ld_done ? ld_pd : fp_pd;
-  wire [63:0] c1val = ld_done ? ld_val : fpu_res;
+  wire                c1en  = ld_done || fpu_vout;
+  wire [PHYS_W-1:0]   c1pd  = ld_done ? ld_pd  : fp_pd;
+  wire [63:0]         c1val = ld_done ? ld_val  : fpu_res;
   wire [ROB_BITS-1:0] c1rob = ld_done ? ld_rtag : fpu_tout[ROB_BITS-1:0];
 
   // ---------------------------------------------------------------------------
@@ -395,62 +443,65 @@ module tinker_core (
   wire [63:0] lsq_h_addr = lsq_base[lsq_head] + lsq_imm[lsq_head];
 
   integer sf;
-  reg fwd_hit;
+  reg        fwd_hit;
   reg [63:0] fwd_val;
   always @(*) begin
     fwd_hit = 0;
     fwd_val = 64'd0;
     for (sf = 0; sf < LSQ_SIZE; sf = sf + 1)
-    if (lsq_v[sf] && lsq_st[sf] && lsq_ardy[sf] && lsq_drdy[sf] &&
+      if (lsq_v[sf] && lsq_st[sf] && lsq_ardy[sf] && lsq_drdy[sf] &&
           (lsq_base[sf] + lsq_imm[sf] == lsq_h_addr)) begin
-      fwd_hit = 1;
-      fwd_val = lsq_data[sf];
-    end
+        fwd_hit = 1;
+        fwd_val = lsq_data[sf];
+      end
   end
 
   // ---------------------------------------------------------------------------
   // REDIRECT
   // ---------------------------------------------------------------------------
-  reg redirect_en;
+  reg        redirect_en;
   reg [63:0] redirect_pc;
 
   // ---------------------------------------------------------------------------
-  // MAIN SEQUENTIAL LOGIC
+  // FREE-SLOT COMBINATIONAL LOGIC
   // ---------------------------------------------------------------------------
   integer i, j;
 
   integer rs_free_slot, fp_free_slot;
   always @(*) begin
     rs_free_slot = 0;
-    for (i = RS_INT - 1; i >= 0; i = i - 1) if (!rs_v[i]) rs_free_slot = i;
+    for (i = RS_INT-1; i >= 0; i = i-1) if (!rs_v[i]) rs_free_slot = i;
     fp_free_slot = 0;
-    for (i = RS_FP - 1; i >= 0; i = i - 1) if (!fp_v[i]) fp_free_slot = i;
+    for (i = RS_FP-1;  i >= 0; i = i-1) if (!fp_v[i]) fp_free_slot = i;
   end
 
   integer rs_iss_idx;
-  reg rs_iss_found;
+  reg     rs_iss_found;
   always @(*) begin
     rs_iss_idx   = 0;
     rs_iss_found = 0;
-    for (i = 0; i < RS_INT; i = i + 1)
-    if (!rs_iss_found && rs_v[i] && rs_psrdy[i] && (rs_uimm[i] || rs_ptrdy[i])) begin
-      rs_iss_idx   = i;
-      rs_iss_found = 1;
-    end
+    for (i = 0; i < RS_INT; i = i+1)
+      if (!rs_iss_found && rs_v[i] && rs_psrdy[i] && (rs_uimm[i] || rs_ptrdy[i])) begin
+        rs_iss_idx   = i;
+        rs_iss_found = 1;
+      end
   end
 
   integer fp_iss_idx;
-  reg fp_iss_found;
+  reg     fp_iss_found;
   always @(*) begin
     fp_iss_idx   = 0;
     fp_iss_found = 0;
-    for (i = 0; i < RS_FP; i = i + 1)
-    if (!fp_iss_found && fp_v[i] && fp_psrdy[i] && fp_ptrdy[i]) begin
-      fp_iss_idx   = i;
-      fp_iss_found = 1;
-    end
+    for (i = 0; i < RS_FP; i = i+1)
+      if (!fp_iss_found && fp_v[i] && fp_psrdy[i] && fp_ptrdy[i]) begin
+        fp_iss_idx   = i;
+        fp_iss_found = 1;
+      end
   end
 
+  // ---------------------------------------------------------------------------
+  // STORE WRITE-ENABLE (combinational)
+  // ---------------------------------------------------------------------------
   always @(*) begin
     lsq_mwe    = 0;
     lsq_maddr  = lsq_h_addr;
@@ -460,121 +511,108 @@ module tinker_core (
       lsq_mwe = 1;
   end
 
+  // ---------------------------------------------------------------------------
+  // MAIN SEQUENTIAL LOGIC
+  // ---------------------------------------------------------------------------
   always @(posedge clk) begin
     if (reset) begin
-      hlt         <= 0;
-      pc_reg      <= `PC_START;
-      dq_v0       <= 0;
-      dq_v1       <= 0;
-      redirect_en <= 0;
-      alu_en      <= 0;
-      fpu_en      <= 0;
-      ld_done     <= 0;
-      rob_head    <= 0;
-      rob_tail    <= 0;
-      rob_cnt     <= 0;
-      lsq_head    <= 0;
-      lsq_tail    <= 0;
-      lsq_cnt     <= 0;
-      rs_cnt      <= 0;
-      fp_cnt      <= 0;
-      fl_head     <= 0;
-      fl_tail     <= 32;
-      fl_cnt      <= 32;
-      for (i = 0; i < 32; i = i + 1) begin
-        arch_rf[i] = 64'd0;
-        rat_map[i] = i[PHYS_W-1:0];
-        prf[i]     = 64'd0;
-        prf_rdy[i] = 1;
+      hlt           <= 0;
+      pc_reg        <= `PC_START;
+      dq_v0         <= 0;
+      dq_v1         <= 0;
+      redirect_en   <= 0;
+      alu_en        <= 0;
+      fpu_en        <= 0;
+      ld_done       <= 0;
+      ld_isret      <= 0;
+      rob_head      <= 0;
+      rob_tail      <= 0;
+      rob_cnt       <= 0;
+      lsq_head      <= 0;
+      lsq_tail      <= 0;
+      lsq_cnt       <= 0;
+      rs_cnt        <= 0;
+      fp_cnt        <= 0;
+      fl_head       <= 0;
+      fl_tail       <= 32;
+      fl_cnt        <= 32;
+
+      for (i = 0; i < 32; i = i+1) begin
+        arch_rf[i]  = 64'd0;
+        rat_map[i]  = i[PHYS_W-1:0];
+        prf[i]      = 64'd0;
+        prf_rdy[i]  = 1;
       end
       arch_rf[31] = 64'd524288;
       prf[31]     = 64'd524288;
-      for (i = 32; i < NPHYS; i = i + 1) begin
+
+      for (i = 32; i < NPHYS; i = i+1) begin
         prf[i]     = 0;
         prf_rdy[i] = 1;
       end
-      for (i = 0; i < 32; i = i + 1) free_list[i] = 6'(32 + i);
-      for (i = 0; i < ROB_SIZE; i = i + 1) begin
-        rob_valid[i] = 0;
-        rob_done[i]  = 0;
-      end
-      for (i = 0; i < RS_INT; i = i + 1) rs_v[i] = 0;
-      for (i = 0; i < RS_FP; i = i + 1) fp_v[i] = 0;
-      for (i = 0; i < LSQ_SIZE; i = i + 1) lsq_v[i] = 0;
-      alu_pd_p1       <= 0;
-      alu_vs_p1       <= 0;
-      alu_imovr_p1    <= 0;
-      alu_imovi_p1    <= 0;
-      fp_pd_p[0]      <= 0;
-      fp_pd_p[1]      <= 0;
-      fp_pd_p[2]      <= 0;
-      alu_vs_p        <= 0;
-      alu_pc_p        <= 0;
-      alu_ibr_p       <= 0;
-      alu_ibgt_p      <= 0;
-      alu_ijmp_p      <= 0;
-      alu_ibrreg_p    <= 0;
-      alu_ibrimm_p    <= 0;
-      alu_imovr_p     <= 0;
-      alu_imovi_p     <= 0;
-      alu_ptaken_p    <= 0;
-      alu_ptgt_p      <= 0;
-      rf_commit_wen   <= 0;
-      rf_commit_waddr <= 0;
-      rf_commit_data  <= 0;
+      for (i = 0;  i < 32;      i = i+1) free_list[i] = 6'(32 + i);
+      for (i = 0;  i < ROB_SIZE; i = i+1) begin rob_valid[i] = 0; rob_done[i] = 0; end
+      for (i = 0;  i < RS_INT;   i = i+1) rs_v[i] = 0;
+      for (i = 0;  i < RS_FP;    i = i+1) fp_v[i] = 0;
+      for (i = 0;  i < LSQ_SIZE; i = i+1) begin lsq_v[i] = 0; lsq_isret[i] = 0; end
+
+      alu_pd_p1 <= 0; alu_vs_p1 <= 0; alu_b_p1 <= 0; alu_pc_p1 <= 0;
+      alu_imovr_p1 <= 0; alu_imovi_p1 <= 0; alu_ical_p1 <= 0; alu_iret_p1 <= 0;
+      alu_ibr_p1 <= 0; alu_ijmp_p1 <= 0; alu_ibrreg_p1 <= 0; alu_ibrimm_p1 <= 0;
+      fp_pd_p[0] <= 0; fp_pd_p[1] <= 0; fp_pd_p[2] <= 0;
+      alu_vs_p <= 0; alu_pc_p <= 0;
+      alu_ibr_p <= 0; alu_ibgt_p <= 0; alu_ijmp_p <= 0;
+      alu_ibrreg_p <= 0; alu_ibrimm_p <= 0;
+      alu_imovr_p <= 0; alu_imovi_p <= 0; alu_ical_p <= 0; alu_iret_p <= 0;
+      alu_ptaken_p <= 0; alu_ptgt_p <= 0;
+      rf_commit_wen <= 0; rf_commit_waddr <= 0; rf_commit_data <= 0;
+
     end else begin
 
       redirect_en   <= 0;
       alu_en        <= 0;
       fpu_en        <= 0;
       ld_done       <= 0;
+      ld_isret      <= 0;
       rf_commit_wen <= 0;
+
+      // ================================================================
+      // PRF SYNC: mirror reg_file.registers[] into prf[0..31] for
+      // registers still at their identity mapping (not renamed/in-flight).
+      // The testbench loads initial register state into reg_file.registers
+      // AFTER reset completes, so we must continuously re-sync on each
+      // cycle for non-in-flight arch registers.
+      // ================================================================
+      for (i = 0; i < 32; i = i+1) begin
+        if (rat_map[i] == i[PHYS_W-1:0] && prf_rdy[i]) begin
+          prf[i]     <= reg_file.registers[i];
+          arch_rf[i] <= reg_file.registers[i];
+        end
+      end
 
       // ================================================================
       // A. CDB BROADCAST
       // ================================================================
-
       if (c0en) begin
         prf[c0pd]         <= c0val;
         prf_rdy[c0pd]     <= 1;
         rob_done[c0rob]   <= 1;
         rob_result[c0rob] <= c0val;
-        if (alu_ibr_p || alu_ijmp_p) begin
-          rob_act_taken[c0rob] <= alu_act_taken;
-          rob_act_tgt[c0rob]   <= alu_act_tgt;
+        if (alu_ibr_p1 || alu_ijmp_p1) begin
+          rob_act_taken[c0rob] <= alu_act_taken_w;
+          rob_act_tgt[c0rob]   <= alu_act_tgt_w;
         end
-        for (i = 0; i < RS_INT; i = i + 1)
-        if (rs_v[i]) begin
-          if (!rs_psrdy[i] && rs_ps[i] == c0pd) begin
-            rs_psrdy[i] <= 1;
-            rs_vs[i] <= c0val;
-          end
-          if (!rs_ptrdy[i] && rs_pt[i] == c0pd) begin
-            rs_ptrdy[i] <= 1;
-            rs_vt[i] <= c0val;
-          end
+        for (i = 0; i < RS_INT; i = i+1) if (rs_v[i]) begin
+          if (!rs_psrdy[i] && rs_ps[i] == c0pd) begin rs_psrdy[i] <= 1; rs_vs[i] <= c0val; end
+          if (!rs_ptrdy[i] && rs_pt[i] == c0pd) begin rs_ptrdy[i] <= 1; rs_vt[i] <= c0val; end
         end
-        for (i = 0; i < RS_FP; i = i + 1)
-        if (fp_v[i]) begin
-          if (!fp_psrdy[i] && fp_ps[i] == c0pd) begin
-            fp_psrdy[i] <= 1;
-            fp_vs[i] <= c0val;
-          end
-          if (!fp_ptrdy[i] && fp_pt[i] == c0pd) begin
-            fp_ptrdy[i] <= 1;
-            fp_vt[i] <= c0val;
-          end
+        for (i = 0; i < RS_FP; i = i+1) if (fp_v[i]) begin
+          if (!fp_psrdy[i] && fp_ps[i] == c0pd) begin fp_psrdy[i] <= 1; fp_vs[i] <= c0val; end
+          if (!fp_ptrdy[i] && fp_pt[i] == c0pd) begin fp_ptrdy[i] <= 1; fp_vt[i] <= c0val; end
         end
-        for (i = 0; i < LSQ_SIZE; i = i + 1)
-        if (lsq_v[i]) begin
-          if (!lsq_ardy[i] && lsq_ps[i] == c0pd) begin
-            lsq_ardy[i] <= 1;
-            lsq_base[i] <= c0val;
-          end
-          if (!lsq_drdy[i] && lsq_pt[i] == c0pd) begin
-            lsq_drdy[i] <= 1;
-            lsq_data[i] <= c0val;
-          end
+        for (i = 0; i < LSQ_SIZE; i = i+1) if (lsq_v[i]) begin
+          if (!lsq_ardy[i] && lsq_ps[i] == c0pd) begin lsq_ardy[i] <= 1; lsq_base[i] <= c0val; end
+          if (!lsq_drdy[i] && lsq_pt[i] == c0pd) begin lsq_drdy[i] <= 1; lsq_data[i] <= c0val; end
         end
       end
 
@@ -583,38 +621,22 @@ module tinker_core (
         prf_rdy[c1pd]     <= 1;
         rob_done[c1rob]   <= 1;
         rob_result[c1rob] <= c1val;
-        for (i = 0; i < RS_INT; i = i + 1)
-        if (rs_v[i]) begin
-          if (!rs_psrdy[i] && rs_ps[i] == c1pd) begin
-            rs_psrdy[i] <= 1;
-            rs_vs[i] <= c1val;
-          end
-          if (!rs_ptrdy[i] && rs_pt[i] == c1pd) begin
-            rs_ptrdy[i] <= 1;
-            rs_vt[i] <= c1val;
-          end
+        // For return: the loaded value is the jump target; record in rob_act_tgt
+        if (ld_done && ld_isret) begin
+          rob_act_taken[c1rob] <= 1'b1;
+          rob_act_tgt[c1rob]   <= ld_val;
         end
-        for (i = 0; i < RS_FP; i = i + 1)
-        if (fp_v[i]) begin
-          if (!fp_psrdy[i] && fp_ps[i] == c1pd) begin
-            fp_psrdy[i] <= 1;
-            fp_vs[i] <= c1val;
-          end
-          if (!fp_ptrdy[i] && fp_pt[i] == c1pd) begin
-            fp_ptrdy[i] <= 1;
-            fp_vt[i] <= c1val;
-          end
+        for (i = 0; i < RS_INT; i = i+1) if (rs_v[i]) begin
+          if (!rs_psrdy[i] && rs_ps[i] == c1pd) begin rs_psrdy[i] <= 1; rs_vs[i] <= c1val; end
+          if (!rs_ptrdy[i] && rs_pt[i] == c1pd) begin rs_ptrdy[i] <= 1; rs_vt[i] <= c1val; end
         end
-        for (i = 0; i < LSQ_SIZE; i = i + 1)
-        if (lsq_v[i]) begin
-          if (!lsq_ardy[i] && lsq_ps[i] == c1pd) begin
-            lsq_ardy[i] <= 1;
-            lsq_base[i] <= c1val;
-          end
-          if (!lsq_drdy[i] && lsq_pt[i] == c1pd) begin
-            lsq_drdy[i] <= 1;
-            lsq_data[i] <= c1val;
-          end
+        for (i = 0; i < RS_FP; i = i+1) if (fp_v[i]) begin
+          if (!fp_psrdy[i] && fp_ps[i] == c1pd) begin fp_psrdy[i] <= 1; fp_vs[i] <= c1val; end
+          if (!fp_ptrdy[i] && fp_pt[i] == c1pd) begin fp_ptrdy[i] <= 1; fp_vt[i] <= c1val; end
+        end
+        for (i = 0; i < LSQ_SIZE; i = i+1) if (lsq_v[i]) begin
+          if (!lsq_ardy[i] && lsq_ps[i] == c1pd) begin lsq_ardy[i] <= 1; lsq_base[i] <= c1val; end
+          if (!lsq_drdy[i] && lsq_pt[i] == c1pd) begin lsq_drdy[i] <= 1; lsq_data[i] <= c1val; end
         end
       end
 
@@ -622,17 +644,16 @@ module tinker_core (
       // B. ROB COMMIT
       // ================================================================
       begin : commit_blk
-        reg do_commit, do_flush;
+        reg              do_flush;
         reg [ROB_BITS-1:0] ch;
-        do_commit = 0;
         do_flush = 0;
         ch = rob_head;
 
         if (rob_cnt > 0 && rob_valid[ch] && rob_done[ch]) begin
-          do_commit = 1;
 
           if (rob_has_dest[ch]) begin
             arch_rf[rob_arch[ch]] <= rob_result[ch];
+            prf[rob_phys[ch]]     <= rob_result[ch];
             rf_commit_data        <= rob_result[ch];
             rf_commit_waddr       <= rob_arch[ch];
             rf_commit_wen         <= 1;
@@ -642,19 +663,18 @@ module tinker_core (
 
           if (rob_has_dest[ch]) begin
             free_list[fl_tail] <= rob_old[ch];
-            fl_tail <= fl_tail + 1;
-            fl_cnt <= fl_cnt + 1;
+            fl_tail            <= fl_tail + 1;
+            fl_cnt             <= fl_cnt  + 1;
           end
 
-          if (rob_is_store[ch]) begin
-            for (i = 0; i < LSQ_SIZE; i = i + 1)
-            if (lsq_v[i] && lsq_st[i] && lsq_rob[i] == ch) lsq_cmt[i] <= 1;
-          end
+          if (rob_is_store[ch])
+            for (i = 0; i < LSQ_SIZE; i = i+1)
+              if (lsq_v[i] && lsq_st[i] && lsq_rob[i] == ch) lsq_cmt[i] <= 1;
 
           if (rob_is_branch[ch] || rob_is_jump[ch]) begin
             if (rob_pred_taken[ch] != rob_act_taken[ch] ||
                 (rob_act_taken[ch] && rob_pred_tgt[ch] != rob_act_tgt[ch])) begin
-              do_flush = 1;
+              do_flush    = 1;
               redirect_en <= 1;
               redirect_pc <= rob_act_taken[ch] ? rob_act_tgt[ch] : (rob_pc[ch] + 64'd4);
             end
@@ -666,22 +686,20 @@ module tinker_core (
           rob_cnt       <= rob_cnt - 1;
 
           if (do_flush) begin
-            for (i = 0; i < RS_INT; i = i + 1) rs_v[i] <= 0;
-            for (i = 0; i < RS_FP; i = i + 1) fp_v[i] <= 0;
-            for (i = 0; i < LSQ_SIZE; i = i + 1) lsq_v[i] <= 0;
-            for (i = 0; i < ROB_SIZE; i = i + 1)
-            if (i[ROB_BITS-1:0] != ch) begin
-              rob_valid[i] <= 0;
-              rob_done[i]  <= 0;
-            end
-            for (i = 0; i < 32; i = i + 1) begin
-              rat_map[i] <= i[PHYS_W-1:0];
-              prf[i]     <= arch_rf[i];
-              prf_rdy[i] <= 1;
+            for (i = 0; i < RS_INT;    i = i+1) rs_v[i]  <= 0;
+            for (i = 0; i < RS_FP;     i = i+1) fp_v[i]  <= 0;
+            for (i = 0; i < LSQ_SIZE;  i = i+1) lsq_v[i] <= 0;
+            for (i = 0; i < ROB_SIZE;  i = i+1)
+              if (i[ROB_BITS-1:0] != ch) begin rob_valid[i] <= 0; rob_done[i] <= 0; end
+            // Restore RAT from committed arch state
+            for (i = 0; i < 32; i = i+1) begin
+              rat_map[i]  <= i[PHYS_W-1:0];
+              prf[i]      <= arch_rf[i];
+              prf_rdy[i]  <= 1;
             end
             prf[31] <= arch_rf[31];
-            for (i = 32; i < NPHYS; i = i + 1) prf_rdy[i] <= 1;
-            for (i = 0; i < 32; i = i + 1) free_list[i] <= 6'(32 + i);
+            for (i = 32; i < NPHYS; i = i+1) prf_rdy[i] <= 1;
+            for (i = 0;  i < 32;    i = i+1) free_list[i] <= 6'(32 + i);
             fl_head  <= 0;
             fl_tail  <= 32;
             fl_cnt   <= 32;
@@ -696,24 +714,25 @@ module tinker_core (
             dq_v1    <= 0;
           end
         end
-      end  // commit_blk
+      end // commit_blk
 
       // ================================================================
       // C. LSQ EXECUTE
       // ================================================================
       if (!redirect_en && lsq_cnt > 0 && lsq_v[lsq_head] && lsq_ardy[lsq_head]) begin
         if (lsq_ld[lsq_head]) begin
-          ld_done  <= 1;
-          ld_pd    <= lsq_pd[lsq_head];
-          ld_rtag  <= lsq_rob[lsq_head];
-          ld_val   <= fwd_hit ? fwd_val : lsq_mrdata;
-          lsq_v[lsq_head] <= 0;
-          lsq_head <= lsq_head + 1;
-          lsq_cnt  <= lsq_cnt  - 1;
+          ld_done          <= 1;
+          ld_pd            <= lsq_pd[lsq_head];
+          ld_rtag          <= lsq_rob[lsq_head];
+          ld_val           <= fwd_hit ? fwd_val : lsq_mrdata;
+          ld_isret         <= lsq_isret[lsq_head];
+          lsq_v[lsq_head]  <= 0;
+          lsq_head         <= lsq_head + 1;
+          lsq_cnt          <= lsq_cnt  - 1;
         end else if (lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head]) begin
-          lsq_v[lsq_head] <= 0;
-          lsq_head <= lsq_head + 1;
-          lsq_cnt <= lsq_cnt - 1;
+          lsq_v[lsq_head]  <= 0;
+          lsq_head         <= lsq_head + 1;
+          lsq_cnt          <= lsq_cnt  - 1;
         end
       end
 
@@ -722,35 +741,37 @@ module tinker_core (
       // ================================================================
       if (!redirect_en) begin
         if (rs_iss_found) begin
-          alu_en           <= 1;
-          alu_op           <= rs_op[rs_iss_idx];
-          alu_a            <= rs_vs[rs_iss_idx];
-          alu_b            <= rs_uimm[rs_iss_idx] ? rs_imm[rs_iss_idx] : rs_vt[rs_iss_idx];
-          alu_rtag         <= {1'b0, rs_rob[rs_iss_idx]};  // zero-extend 5->6 bits
-          alu_pd           <= rob_phys[rs_rob[rs_iss_idx]];
-          alu_vs_p         <= rs_vs[rs_iss_idx];
-          alu_pc_p         <= rs_pc[rs_iss_idx];
-          alu_ibr_p        <= rs_ibr[rs_iss_idx];
-          alu_ibgt_p       <= rs_ibgt[rs_iss_idx];
-          alu_ijmp_p       <= rs_ijmp[rs_iss_idx];
-          alu_ibrreg_p     <= rs_ibrreg[rs_iss_idx];
-          alu_ibrimm_p     <= rs_ibrimm[rs_iss_idx];
-          alu_imovr_p      <= rs_imovr[rs_iss_idx];
-          alu_imovi_p      <= rs_imovi[rs_iss_idx];
-          alu_ptaken_p     <= rs_ptaken[rs_iss_idx];
-          alu_ptgt_p       <= rs_ptgt[rs_iss_idx];
+          alu_en       <= 1;
+          alu_op       <= rs_op[rs_iss_idx];
+          alu_a        <= rs_vs[rs_iss_idx];
+          alu_b        <= rs_uimm[rs_iss_idx] ? rs_imm[rs_iss_idx] : rs_vt[rs_iss_idx];
+          alu_rtag     <= {1'b0, rs_rob[rs_iss_idx]};
+          alu_pd       <= rob_phys[rs_rob[rs_iss_idx]];
+          alu_vs_p     <= rs_vs[rs_iss_idx];
+          alu_pc_p     <= rs_pc[rs_iss_idx];
+          alu_ibr_p    <= rs_ibr[rs_iss_idx];
+          alu_ibgt_p   <= rs_ibgt[rs_iss_idx];
+          alu_ijmp_p   <= rs_ijmp[rs_iss_idx];
+          alu_ibrreg_p <= rs_ibrreg[rs_iss_idx];
+          alu_ibrimm_p <= rs_ibrimm[rs_iss_idx];
+          alu_imovr_p  <= rs_imovr[rs_iss_idx];
+          alu_imovi_p  <= rs_imovi[rs_iss_idx];
+          alu_ical_p   <= rs_ical[rs_iss_idx];
+          alu_iret_p   <= rs_iret[rs_iss_idx];
+          alu_ptaken_p <= rs_ptaken[rs_iss_idx];
+          alu_ptgt_p   <= rs_ptgt[rs_iss_idx];
           rs_v[rs_iss_idx] <= 0;
-          rs_cnt           <= rs_cnt - 1;
+          rs_cnt       <= rs_cnt - 1;
         end
         if (fp_iss_found) begin
           fpu_en   <= 1;
           fpu_op   <= fp_op[fp_iss_idx];
           fpu_a    <= fp_vs[fp_iss_idx];
           fpu_b    <= fp_vt[fp_iss_idx];
-          fpu_rtag <= {1'b0, fp_rob[fp_iss_idx]};  // zero-extend 5->6 bits
+          fpu_rtag <= {1'b0, fp_rob[fp_iss_idx]};
           fpu_pd   <= rob_phys[fp_rob[fp_iss_idx]];
           fp_v[fp_iss_idx] <= 0;
-          fp_cnt <= fp_cnt - 1;
+          fp_cnt   <= fp_cnt - 1;
         end
       end
 
@@ -764,23 +785,30 @@ module tinker_core (
       // ================================================================
       if (!redirect_en) begin : dispatch_blk
         reg [PHYS_W-1:0] p0_new, p0_old, p0_ps, p0_pt;
-        reg [63:0] p0_vs, p0_vt;
-        reg p0_psrdy, p0_ptrdy;
+        reg [63:0]        p0_vs,  p0_vt;
+        reg               p0_psrdy, p0_ptrdy;
         reg [ROB_BITS-1:0] p0_rob;
+        // r31 phys reg (for call stack store and return stack load)
+        reg [PHYS_W-1:0]  p0_r31_phys;
+        reg [63:0]         p0_r31_val;
+        reg                p0_r31_rdy;
 
         reg [PHYS_W-1:0] p1_new, p1_old, p1_ps, p1_pt;
-        reg [63:0] p1_vs, p1_vt;
-        reg p1_psrdy, p1_ptrdy;
+        reg [63:0]        p1_vs,  p1_vt;
+        reg               p1_psrdy, p1_ptrdy;
         reg [ROB_BITS-1:0] p1_rob;
+        reg [PHYS_W-1:0]  p1_r31_phys;
+        reg [63:0]         p1_r31_val;
+        reg                p1_r31_rdy;
 
-        reg [5:0] fh;
-        reg [6:0] fc;
+        reg [5:0]          fh;
+        reg [6:0]          fc;
         reg [ROB_BITS-1:0] rt;
-        reg [ROB_BITS:0] rc;
-        reg [3:0] rsc;
-        reg [2:0] fpc;
-        reg [4:0] lc;
-        reg [3:0] lt;
+        reg [ROB_BITS:0]   rc;
+        reg [3:0]          rsc;
+        reg [2:0]          fpc;
+        reg [4:0]          lc;
+        reg [3:0]          lt;
 
         fh  = fl_head;
         fc  = fl_cnt;
@@ -793,18 +821,22 @@ module tinker_core (
 
         // -------- instr 0 --------
         if (d0_en) begin
-          p0_ps    = rat_map[d0_rs];
-          p0_pt    = rat_map[d0_rt];
-          p0_vs    = prf[p0_ps];
-          p0_vt    = prf[p0_pt];
-          p0_psrdy = prf_rdy[p0_ps];
-          p0_ptrdy = prf_rdy[p0_pt];
+          p0_ps      = rat_map[d0_rs];
+          p0_pt      = rat_map[d0_rt];  // For call: d0_rt=r31 (from decoder fix)
+          p0_vs      = prf[p0_ps];
+          p0_vt      = prf[p0_pt];
+          p0_psrdy   = prf_rdy[p0_ps];
+          p0_ptrdy   = prf_rdy[p0_pt];
+          // r31 for call/return (always read r31's current phys mapping)
+          p0_r31_phys = rat_map[5'd31];
+          p0_r31_val  = prf[p0_r31_phys];
+          p0_r31_rdy  = prf_rdy[p0_r31_phys];
 
           if (d0_wr && fc > 0) begin
             p0_new = free_list[fh];
             p0_old = rat_map[d0_rd];
-            fh = fh + 1;
-            fc = fc - 1;
+            fh     = fh + 1;
+            fc     = fc - 1;
             rat_map[d0_rd]  <= p0_new;
             prf_rdy[p0_new] <= 0;
           end else begin
@@ -813,15 +845,15 @@ module tinker_core (
           end
 
           p0_rob = rt;
-          rt = rt + 1;
-          rc = rc + 1;
+          rt     = rt + 1;
+          rc     = rc + 1;
           rob_valid[p0_rob]      <= 1;
-          rob_done[p0_rob]       <= (!d0_wr || d0_hlt || d0_st) ? 1 : 0;
+          rob_done[p0_rob]       <= (!d0_wr || d0_hlt || d0_st || d0_ret) ? 1 : 0;
           rob_arch[p0_rob]       <= d0_rd;
           rob_phys[p0_rob]       <= p0_new;
           rob_old[p0_rob]        <= p0_old;
           rob_has_dest[p0_rob]   <= d0_wr;
-          rob_is_store[p0_rob]   <= d0_st;
+          rob_is_store[p0_rob]   <= d0_st || d0_call; // call also has a stack store
           rob_is_halt[p0_rob]    <= d0_hlt;
           rob_is_branch[p0_rob]  <= d0_br;
           rob_is_jump[p0_rob]    <= d0_jmp || d0_call || d0_ret;
@@ -832,19 +864,93 @@ module tinker_core (
           rob_act_tgt[p0_rob]    <= 0;
 
           if (d0_mem) begin
-            lsq_v[lt]    <= 1;
-            lsq_ld[lt]   <= d0_ld;
-            lsq_st[lt]   <= d0_st;
-            lsq_ardy[lt] <= p0_psrdy;
-            lsq_drdy[lt] <= d0_ld ? 1'b1 : p0_ptrdy;
-            lsq_cmt[lt]  <= 0;
-            lsq_base[lt] <= p0_vs;
-            lsq_data[lt] <= p0_vt;
-            lsq_imm[lt]  <= d0_imm;
-            lsq_ps[lt]   <= p0_ps;
-            lsq_pt[lt]   <= p0_pt;
-            lsq_pd[lt]   <= p0_new;
-            lsq_rob[lt]  <= p0_rob;
+            // Regular load/store
+            lsq_v[lt]       <= 1;
+            lsq_ld[lt]      <= d0_ld;
+            lsq_st[lt]      <= d0_st;
+            lsq_ardy[lt]    <= p0_psrdy;
+            lsq_drdy[lt]    <= d0_ld ? 1'b1 : p0_ptrdy;
+            lsq_cmt[lt]     <= 0;
+            lsq_base[lt]    <= p0_vs;
+            lsq_data[lt]    <= p0_vt;
+            lsq_imm[lt]     <= d0_imm;
+            lsq_ps[lt]      <= p0_ps;
+            lsq_pt[lt]      <= p0_pt;
+            lsq_pd[lt]      <= p0_new;
+            lsq_rob[lt]     <= p0_rob;
+            lsq_isret[lt]   <= 0;
+            lt = lt + 1;
+            lc = lc + 1;
+          end else if (d0_call) begin
+            // call: dispatch RS entry for link-register write (rd=pc+4)
+            //       AND a store entry to push pc+4 onto stack at mem[r31-8]
+            // RS entry for jump+link (ical flag makes result=pc+4):
+            rs_v[rs_free_slot]      <= 1;
+            rs_op[rs_free_slot]     <= 5'd0; // ADD (dummy, result overridden by ical)
+            rs_ps[rs_free_slot]     <= p0_ps;    // rd (jump target)
+            rs_pt[rs_free_slot]     <= p0_ps;
+            rs_psrdy[rs_free_slot]  <= p0_psrdy;
+            rs_ptrdy[rs_free_slot]  <= 1;
+            rs_vs[rs_free_slot]     <= p0_vs;    // rd value = jump target
+            rs_vt[rs_free_slot]     <= 64'd0;
+            rs_imm[rs_free_slot]    <= 64'd0;
+            rs_uimm[rs_free_slot]   <= 1;
+            rs_rob[rs_free_slot]    <= p0_rob;
+            rs_pc[rs_free_slot]     <= dq_pc0;
+            rs_ibr[rs_free_slot]    <= 0;
+            rs_ibgt[rs_free_slot]   <= 0;
+            rs_ijmp[rs_free_slot]   <= 1;
+            rs_ibrreg[rs_free_slot] <= 0;
+            rs_ibrimm[rs_free_slot] <= 0;
+            rs_imovr[rs_free_slot]  <= 0;
+            rs_imovi[rs_free_slot]  <= 0;
+            rs_ical[rs_free_slot]   <= 1;
+            rs_iret[rs_free_slot]   <= 0;
+            rs_ptaken[rs_free_slot] <= 0;
+            rs_ptgt[rs_free_slot]   <= dq_pc0 + 64'd4;
+            rsc = rsc + 1;
+            // Store entry: push pc+4 to mem[r31-8]
+            // data = pc+4 (known now), base = r31, imm = -8
+            // The store needs rob_commit before writing.  Give it a separate ROB entry.
+            // Actually the simplest is: mark this store as needing commit from p0_rob.
+            // We'll use a second LSQ slot with the same rob_tag (so it gets committed
+            // when the call's ROB entry commits).
+            lsq_v[lt]       <= 1;
+            lsq_ld[lt]      <= 0;
+            lsq_st[lt]      <= 1;
+            lsq_ardy[lt]    <= p0_r31_rdy;   // base=r31
+            lsq_drdy[lt]    <= 1;             // data=pc+4 known now
+            lsq_cmt[lt]     <= 0;
+            lsq_base[lt]    <= p0_r31_val;    // r31 value
+            lsq_data[lt]    <= dq_pc0 + 64'd4; // return address = pc+4
+            lsq_imm[lt]     <= 64'hFFFFFFFFFFFFFFF8; // -8 (signed)
+            lsq_ps[lt]      <= p0_r31_phys;
+            lsq_pt[lt]      <= p0_r31_phys;   // unused for store data
+            lsq_pd[lt]      <= p0_new;
+            lsq_rob[lt]     <= p0_rob;
+            lsq_isret[lt]   <= 0;
+            lt = lt + 1;
+            lc = lc + 1;
+          end else if (d0_ret) begin
+            // return: load from mem[r31-8], loaded value -> PC redirect
+            // No dest register (d0_wr=0, rob_done set immediately above)
+            // But we DO need the ROB to wait for the load to get the jump target.
+            // Override: mark rob_done=0 so commit waits for the load result.
+            rob_done[p0_rob] <= 0;
+            lsq_v[lt]        <= 1;
+            lsq_ld[lt]       <= 1;
+            lsq_st[lt]       <= 0;
+            lsq_ardy[lt]     <= p0_psrdy;   // raddr1=r31
+            lsq_drdy[lt]     <= 1;
+            lsq_cmt[lt]      <= 0;
+            lsq_base[lt]     <= p0_vs;      // r31 value
+            lsq_data[lt]     <= 64'd0;
+            lsq_imm[lt]      <= 64'hFFFFFFFFFFFFFFF8; // -8
+            lsq_ps[lt]       <= p0_ps;
+            lsq_pt[lt]       <= p0_ps;
+            lsq_pd[lt]       <= p0_new;     // dummy phys dest (not written to arch)
+            lsq_rob[lt]      <= p0_rob;
+            lsq_isret[lt]    <= 1;          // signal: loaded value = jump target
             lt = lt + 1;
             lc = lc + 1;
           end else if (d0_fp) begin
@@ -873,11 +979,13 @@ module tinker_core (
             rs_pc[rs_free_slot]     <= dq_pc0;
             rs_ibr[rs_free_slot]    <= d0_br;
             rs_ibgt[rs_free_slot]   <= d0_brgt;
-            rs_ijmp[rs_free_slot]   <= d0_jmp || d0_call || d0_ret;
+            rs_ijmp[rs_free_slot]   <= d0_jmp;
             rs_ibrreg[rs_free_slot] <= d0_brrr;
             rs_ibrimm[rs_free_slot] <= d0_brri;
             rs_imovr[rs_free_slot]  <= d0_mvr;
             rs_imovi[rs_free_slot]  <= d0_mvi;
+            rs_ical[rs_free_slot]   <= 0;
+            rs_iret[rs_free_slot]   <= 0;
             rs_ptaken[rs_free_slot] <= 0;
             rs_ptgt[rs_free_slot]   <= dq_pc0 + 64'd4;
             rsc = rsc + 1;
@@ -886,18 +994,21 @@ module tinker_core (
 
         // -------- instr 1 --------
         if (d1_en) begin
-          p1_ps    = (d0_en && d0_wr && d0_rd == d1_rs) ? p0_new : rat_map[d1_rs];
-          p1_pt    = (d0_en && d0_wr && d0_rd == d1_rt) ? p0_new : rat_map[d1_rt];
-          p1_vs    = prf[p1_ps];
-          p1_vt    = prf[p1_pt];
-          p1_psrdy = prf_rdy[p1_ps];
-          p1_ptrdy = prf_rdy[p1_pt];
+          p1_ps      = (d0_en && d0_wr && d0_rd == d1_rs) ? p0_new : rat_map[d1_rs];
+          p1_pt      = (d0_en && d0_wr && d0_rd == d1_rt) ? p0_new : rat_map[d1_rt];
+          p1_vs      = prf[p1_ps];
+          p1_vt      = prf[p1_pt];
+          p1_psrdy   = prf_rdy[p1_ps];
+          p1_ptrdy   = prf_rdy[p1_pt];
+          p1_r31_phys = rat_map[5'd31];
+          p1_r31_val  = prf[p1_r31_phys];
+          p1_r31_rdy  = prf_rdy[p1_r31_phys];
 
           if (d1_wr && fc > 0) begin
             p1_new = free_list[fh];
             p1_old = (d0_en && d0_wr && d0_rd == d1_rd) ? p0_new : rat_map[d1_rd];
-            fh = fh + 1;
-            fc = fc - 1;
+            fh     = fh + 1;
+            fc     = fc - 1;
             rat_map[d1_rd]  <= p1_new;
             prf_rdy[p1_new] <= 0;
           end else begin
@@ -906,15 +1017,15 @@ module tinker_core (
           end
 
           p1_rob = rt;
-          rt = rt + 1;
-          rc = rc + 1;
+          rt     = rt + 1;
+          rc     = rc + 1;
           rob_valid[p1_rob]      <= 1;
-          rob_done[p1_rob]       <= (!d1_wr || d1_hlt || d1_st) ? 1 : 0;
+          rob_done[p1_rob]       <= (!d1_wr || d1_hlt || d1_st || d1_ret) ? 1 : 0;
           rob_arch[p1_rob]       <= d1_rd;
           rob_phys[p1_rob]       <= p1_new;
           rob_old[p1_rob]        <= p1_old;
           rob_has_dest[p1_rob]   <= d1_wr;
-          rob_is_store[p1_rob]   <= d1_st;
+          rob_is_store[p1_rob]   <= d1_st || d1_call;
           rob_is_halt[p1_rob]    <= d1_hlt;
           rob_is_branch[p1_rob]  <= d1_br;
           rob_is_jump[p1_rob]    <= d1_jmp || d1_call || d1_ret;
@@ -925,26 +1036,91 @@ module tinker_core (
           rob_act_tgt[p1_rob]    <= 0;
 
           if (d1_mem) begin
-            lsq_v[lt]    <= 1;
-            lsq_ld[lt]   <= d1_ld;
-            lsq_st[lt]   <= d1_st;
-            lsq_ardy[lt] <= p1_psrdy;
-            lsq_drdy[lt] <= d1_ld ? 1'b1 : p1_ptrdy;
-            lsq_cmt[lt]  <= 0;
-            lsq_base[lt] <= p1_vs;
-            lsq_data[lt] <= p1_vt;
-            lsq_imm[lt]  <= d1_imm;
-            lsq_ps[lt]   <= p1_ps;
-            lsq_pt[lt]   <= p1_pt;
-            lsq_pd[lt]   <= p1_new;
-            lsq_rob[lt]  <= p1_rob;
+            lsq_v[lt]       <= 1;
+            lsq_ld[lt]      <= d1_ld;
+            lsq_st[lt]      <= d1_st;
+            lsq_ardy[lt]    <= p1_psrdy;
+            lsq_drdy[lt]    <= d1_ld ? 1'b1 : p1_ptrdy;
+            lsq_cmt[lt]     <= 0;
+            lsq_base[lt]    <= p1_vs;
+            lsq_data[lt]    <= p1_vt;
+            lsq_imm[lt]     <= d1_imm;
+            lsq_ps[lt]      <= p1_ps;
+            lsq_pt[lt]      <= p1_pt;
+            lsq_pd[lt]      <= p1_new;
+            lsq_rob[lt]     <= p1_rob;
+            lsq_isret[lt]   <= 0;
+            lt = lt + 1;
+            lc = lc + 1;
+          end else if (d1_call) begin
+            begin : rs_slot1_call
+              reg [3:0] rslot;
+              rslot = 0;
+              for (j = RS_INT-1; j >= 0; j = j-1) if (!rs_v[j]) rslot = j[3:0];
+              rs_v[rslot]      <= 1;
+              rs_op[rslot]     <= 5'd0;
+              rs_ps[rslot]     <= p1_ps;
+              rs_pt[rslot]     <= p1_ps;
+              rs_psrdy[rslot]  <= p1_psrdy;
+              rs_ptrdy[rslot]  <= 1;
+              rs_vs[rslot]     <= p1_vs;
+              rs_vt[rslot]     <= 64'd0;
+              rs_imm[rslot]    <= 64'd0;
+              rs_uimm[rslot]   <= 1;
+              rs_rob[rslot]    <= p1_rob;
+              rs_pc[rslot]     <= dq_pc1;
+              rs_ibr[rslot]    <= 0;
+              rs_ibgt[rslot]   <= 0;
+              rs_ijmp[rslot]   <= 1;
+              rs_ibrreg[rslot] <= 0;
+              rs_ibrimm[rslot] <= 0;
+              rs_imovr[rslot]  <= 0;
+              rs_imovi[rslot]  <= 0;
+              rs_ical[rslot]   <= 1;
+              rs_iret[rslot]   <= 0;
+              rs_ptaken[rslot] <= 0;
+              rs_ptgt[rslot]   <= dq_pc1 + 64'd4;
+              rsc = rsc + 1;
+            end
+            lsq_v[lt]       <= 1;
+            lsq_ld[lt]      <= 0;
+            lsq_st[lt]      <= 1;
+            lsq_ardy[lt]    <= p1_r31_rdy;
+            lsq_drdy[lt]    <= 1;
+            lsq_cmt[lt]     <= 0;
+            lsq_base[lt]    <= p1_r31_val;
+            lsq_data[lt]    <= dq_pc1 + 64'd4;
+            lsq_imm[lt]     <= 64'hFFFFFFFFFFFFFFF8;
+            lsq_ps[lt]      <= p1_r31_phys;
+            lsq_pt[lt]      <= p1_r31_phys;
+            lsq_pd[lt]      <= p1_new;
+            lsq_rob[lt]     <= p1_rob;
+            lsq_isret[lt]   <= 0;
+            lt = lt + 1;
+            lc = lc + 1;
+          end else if (d1_ret) begin
+            rob_done[p1_rob] <= 0;
+            lsq_v[lt]        <= 1;
+            lsq_ld[lt]       <= 1;
+            lsq_st[lt]       <= 0;
+            lsq_ardy[lt]     <= p1_psrdy;
+            lsq_drdy[lt]     <= 1;
+            lsq_cmt[lt]      <= 0;
+            lsq_base[lt]     <= p1_vs;
+            lsq_data[lt]     <= 64'd0;
+            lsq_imm[lt]      <= 64'hFFFFFFFFFFFFFFF8;
+            lsq_ps[lt]       <= p1_ps;
+            lsq_pt[lt]       <= p1_ps;
+            lsq_pd[lt]       <= p1_new;
+            lsq_rob[lt]      <= p1_rob;
+            lsq_isret[lt]    <= 1;
             lt = lt + 1;
             lc = lc + 1;
           end else if (d1_fp) begin
             begin : fp_slot1
               reg [2:0] fslot;
               fslot = 0;
-              for (j = RS_FP - 1; j >= 0; j = j - 1) if (!fp_v[j]) fslot = j[2:0];
+              for (j = RS_FP-1; j >= 0; j = j-1) if (!fp_v[j]) fslot = j[2:0];
               fp_v[fslot]     <= 1;
               fp_op[fslot]    <= d1_op;
               fp_ps[fslot]    <= p1_ps;
@@ -960,7 +1136,7 @@ module tinker_core (
             begin : rs_slot1
               reg [3:0] rslot;
               rslot = 0;
-              for (j = RS_INT - 1; j >= 0; j = j - 1) if (!rs_v[j]) rslot = j[3:0];
+              for (j = RS_INT-1; j >= 0; j = j-1) if (!rs_v[j]) rslot = j[3:0];
               rs_v[rslot]      <= 1;
               rs_op[rslot]     <= d1_op;
               rs_ps[rslot]     <= p1_ps;
@@ -975,11 +1151,13 @@ module tinker_core (
               rs_pc[rslot]     <= dq_pc1;
               rs_ibr[rslot]    <= d1_br;
               rs_ibgt[rslot]   <= d1_brgt;
-              rs_ijmp[rslot]   <= d1_jmp || d1_call || d1_ret;
+              rs_ijmp[rslot]   <= d1_jmp;
               rs_ibrreg[rslot] <= d1_brrr;
               rs_ibrimm[rslot] <= d1_brri;
               rs_imovr[rslot]  <= d1_mvr;
               rs_imovi[rslot]  <= d1_mvi;
+              rs_ical[rslot]   <= 0;
+              rs_iret[rslot]   <= 0;
               rs_ptaken[rslot] <= 0;
               rs_ptgt[rslot]   <= dq_pc1 + 64'd4;
               rsc = rsc + 1;
@@ -995,7 +1173,7 @@ module tinker_core (
         fp_cnt   <= fpc;
         lsq_tail <= lt;
         lsq_cnt  <= lc;
-      end  // dispatch_blk
+      end // dispatch_blk
 
       // ================================================================
       // F. FETCH / DECODE QUEUE
@@ -1014,7 +1192,7 @@ module tinker_core (
         pc_reg <= pc_reg + 64'd8;
       end
 
-    end  // !reset
-  end  // always
+    end // !reset
+  end // always
 
 endmodule
