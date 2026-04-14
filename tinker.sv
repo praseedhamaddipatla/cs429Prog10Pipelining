@@ -817,6 +817,11 @@ module tinker_core (
         reg [63:0]         p1_r31_val;
         reg                p1_r31_rdy;
 
+        // Track which RS slots d0 already claimed, so d1 picks a different one.
+        reg [3:0]          rs_d0_slot;
+        reg [2:0]          fp_d0_slot;
+        reg                d0_used_rs, d0_used_fp;
+
         reg [5:0]          fh;
         reg [6:0]          fc;
         reg [ROB_BITS-1:0] rt;
@@ -833,6 +838,8 @@ module tinker_core (
         rsc = rs_cnt;
         fpc = fp_cnt;
         lc  = lsq_cnt;
+        rs_d0_slot = 0; d0_used_rs = 0;
+        fp_d0_slot = 0; d0_used_fp = 0;
         lt  = lsq_tail;
 
         // -------- instr 0 --------
@@ -919,6 +926,7 @@ module tinker_core (
             rt = rt - 1;
             rob_valid[p0_rob] <= 0;
           end else if (d0_fp) begin
+            fp_d0_slot = fp_free_slot[2:0]; d0_used_fp = 1;
             fp_v[fp_free_slot]     <= 1;
             fp_op[fp_free_slot]    <= d0_op;
             fp_ps[fp_free_slot]    <= p0_ps;
@@ -930,6 +938,7 @@ module tinker_core (
             fp_rob[fp_free_slot]   <= p0_rob;
             fpc = fpc + 1;
           end else if (!d0_hlt) begin
+            rs_d0_slot = rs_free_slot[3:0]; d0_used_rs = 1;
             rs_v[rs_free_slot]      <= 1;
             rs_op[rs_free_slot]     <= d0_op;
             rs_ps[rs_free_slot]     <= p0_ps;
@@ -1035,7 +1044,9 @@ module tinker_core (
             begin : fp_slot1
               reg [2:0] fslot;
               fslot = 0;
-              for (j = RS_FP-1; j >= 0; j = j-1) if (!fp_v[j]) fslot = j[2:0];
+              // Skip the slot d0 already claimed this cycle (NBA not yet visible).
+              for (j = RS_FP-1; j >= 0; j = j-1)
+                if (!fp_v[j] && (!d0_used_fp || 3'(j) != fp_d0_slot)) fslot = j[2:0];
               fp_v[fslot]     <= 1;
               fp_op[fslot]    <= d1_op;
               fp_ps[fslot]    <= p1_ps;
@@ -1051,7 +1062,9 @@ module tinker_core (
             begin : rs_slot1
               reg [3:0] rslot;
               rslot = 0;
-              for (j = RS_INT-1; j >= 0; j = j-1) if (!rs_v[j]) rslot = j[3:0];
+              // Skip the slot d0 already claimed this cycle.
+              for (j = RS_INT-1; j >= 0; j = j-1)
+                if (!rs_v[j] && (!d0_used_rs || 4'(j) != rs_d0_slot)) rslot = j[3:0];
               rs_v[rslot]      <= 1;
               rs_op[rslot]     <= d1_op;
               rs_ps[rslot]     <= p1_ps;
