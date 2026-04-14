@@ -24,7 +24,7 @@ logic [63:0] data_addr, write_data;
 logic        we;
 logic [63:0] read_data;
 
-mem_module #(.MEM_SIZE(MEM_SZ)) dut_mem (
+memory #(.MEM_SIZE(MEM_SZ)) dut_mem (
     .clk        (clk),
     .fetch_addr0(fetch_addr0),
     .fetch_addr1(fetch_addr1),
