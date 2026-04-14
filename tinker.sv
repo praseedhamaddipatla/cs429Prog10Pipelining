@@ -88,7 +88,7 @@ module tinker_core (
   reg rs_uimm[0:RS_INT-1];
   reg [ROB_BITS-1:0] rs_rob[0:RS_INT-1];
   reg [63:0] rs_pc[0:RS_INT-1];
-  reg rs_ibr[0:RS_INT-1];  // is_branch
+  reg rs_ibr[0:RS_INT-1];
   reg rs_ibgt[0:RS_INT-1];
   reg rs_ijmp[0:RS_INT-1];
   reg rs_ibrreg[0:RS_INT-1];
@@ -123,9 +123,9 @@ module tinker_core (
   reg lsq_v[0:LSQ_SIZE-1];
   reg lsq_ld[0:LSQ_SIZE-1];
   reg lsq_st[0:LSQ_SIZE-1];
-  reg lsq_ardy[0:LSQ_SIZE-1];  // address ready
-  reg lsq_drdy[0:LSQ_SIZE-1];  // data ready
-  reg lsq_cmt[0:LSQ_SIZE-1];  // store committed by rob
+  reg lsq_ardy[0:LSQ_SIZE-1];
+  reg lsq_drdy[0:LSQ_SIZE-1];
+  reg lsq_cmt[0:LSQ_SIZE-1];
   reg [63:0] lsq_base[0:LSQ_SIZE-1];
   reg [63:0] lsq_data[0:LSQ_SIZE-1];
   reg [63:0] lsq_imm[0:LSQ_SIZE-1];
@@ -166,123 +166,116 @@ module tinker_core (
   // STALL / DISPATCH ENABLES
   // ---------------------------------------------------------------------------
   wire       stall = rob_full || rs_full || fp_full || lsq_full;
-  wire       d0_en = dq_v0 && !stall;  // dispatch instr 0
-  wire       d1_en = dq_v1 && !stall && !d0_hlt;  // instr 1 only if instr 0 is not halt
+  wire       d0_en = dq_v0 && !stall;
+  wire       d1_en = dq_v1 && !stall && !d0_hlt;
 
- // ---------------------------------------------------------------------------
-// FUNCTIONAL UNIT ISSUE REGISTERS
-// ---------------------------------------------------------------------------
-// int alu — registered issue
-reg        alu_en;
-reg  [4:0] alu_op;
-reg [63:0] alu_a, alu_b;
-reg [ROB_BITS-1:0] alu_rtag;
-reg [  PHYS_W-1:0] alu_pd;
+  // ---------------------------------------------------------------------------
+  // FUNCTIONAL UNIT ISSUE REGISTERS
+  // alu_rtag / fpu_rtag are 6 bits to match the alu/fpu rob_tag_in port width
+  // ---------------------------------------------------------------------------
+  reg        alu_en;
+  reg  [4:0] alu_op;
+  reg [63:0] alu_a, alu_b;
+  reg [5:0] alu_rtag;
+  reg [PHYS_W-1:0] alu_pd;
 
-// side-channel through 1-cycle pipe
-reg [63:0] alu_vs_p, alu_pc_p;
-reg alu_ibr_p, alu_ibgt_p, alu_ijmp_p, alu_ibrreg_p, alu_ibrimm_p;
-reg alu_imovr_p, alu_imovi_p;
-reg        alu_ptaken_p;
-reg [63:0] alu_ptgt_p;
+  reg [63:0] alu_vs_p, alu_pc_p;
+  reg alu_ibr_p, alu_ibgt_p, alu_ijmp_p, alu_ibrreg_p, alu_ibrimm_p;
+  reg alu_imovr_p, alu_imovi_p;
+  reg        alu_ptaken_p;
+  reg [63:0] alu_ptgt_p;
 
-// fp — registered issue
-reg        fpu_en;
-reg [ 4:0] fpu_op;
-reg [63:0] fpu_a, fpu_b;
-reg  [ROB_BITS-1:0] fpu_rtag;
-reg  [  PHYS_W-1:0] fpu_pd;
+  reg        fpu_en;
+  reg [ 4:0] fpu_op;
+  reg [63:0] fpu_a, fpu_b;
+  reg  [       5:0] fpu_rtag;
+  reg  [PHYS_W-1:0] fpu_pd;
 
-// fp pd 3-stage shift
-reg  [  PHYS_W-1:0] fp_pd_p [0:2];
+  reg  [PHYS_W-1:0] fp_pd_p                        [0:2];
 
-// ---------------------------------------------------------------------------
-// ALU / FPU INSTANTIATION
-// ---------------------------------------------------------------------------
-wire                alu_vout;
-wire [        63:0] alu_res;
-wire [         5:0] alu_tout;
+  // ---------------------------------------------------------------------------
+  // ALU / FPU WIRES
+  // ---------------------------------------------------------------------------
+  wire              alu_vout;
+  wire [      63:0] alu_res;
+  wire [       5:0] alu_tout;
 
-wire                fpu_vout;
-wire [        63:0] fpu_res;
-wire [         5:0] fpu_tout;
+  wire              fpu_vout;
+  wire [      63:0] fpu_res;
+  wire [       5:0] fpu_tout;
 
-// keep your decode (unchanged)
-wire fpu_is_add = (fpu_op == 5'd10);
-wire fpu_is_sub = (fpu_op == 5'd11);
-wire fpu_is_mul = (fpu_op == 5'd12);
-wire fpu_is_div = (fpu_op == 5'd13);
+  wire              fpu_is_add = (fpu_op == 5'd10);
+  wire              fpu_is_sub = (fpu_op == 5'd11);
+  wire              fpu_is_mul = (fpu_op == 5'd12);
+  wire              fpu_is_div = (fpu_op == 5'd13);
 
-reg [2:0] fpu_sel;
-always @(*) begin
-    if (fpu_is_add)      fpu_sel = 3'd0;
+  reg  [       2:0] fpu_sel;
+  always @(*) begin
+    if (fpu_is_add) fpu_sel = 3'd0;
     else if (fpu_is_sub) fpu_sel = 3'd1;
     else if (fpu_is_mul) fpu_sel = 3'd2;
     else if (fpu_is_div) fpu_sel = 3'd3;
-    else                 fpu_sel = 3'd0; // safe default
-end
-
-// ----------------------
-// ALU (instance name: alu — required by autograder)
-// ----------------------
-alu alu (
-    .clk(clk),
-    .reset(reset),
-    .valid_in(alu_en),
-    .a(alu_a),
-    .b(alu_b),
-    .op(alu_op),
-    .rob_tag_in(alu_rtag),
-    .valid_out(alu_vout),
-    .result(alu_res),
-    .rob_tag_out(alu_tout)
-);
-
-// ----------------------
-// UNIFIED FPU (instance name: fpu — required by autograder)
-// ----------------------
-fpu fpu (
-    .clk(clk),
-    .reset(reset),
-    .valid_in(fpu_en && (fpu_is_add || fpu_is_sub || fpu_is_mul || fpu_is_div)),
-    .a(fpu_a),
-    .b(fpu_b),
-    .op(fpu_sel),
-    .rob_tag_in(fpu_rtag),
-    .valid_out(fpu_vout),
-    .result(fpu_res),
-    .rob_tag_out(fpu_tout)
-);
+    else fpu_sel = 3'd0;
+  end
 
   // ---------------------------------------------------------------------------
-  // MEMORY (instance name: memory — required by autograder)
+  // ALU  (instance name "alu" required by autograder)
+  // ---------------------------------------------------------------------------
+  alu alu (
+      .clk        (clk),
+      .reset      (reset),
+      .valid_in   (alu_en),
+      .a          (alu_a),
+      .b          (alu_b),
+      .op         (alu_op),
+      .rob_tag_in (alu_rtag),
+      .valid_out  (alu_vout),
+      .result     (alu_res),
+      .rob_tag_out(alu_tout)
+  );
+
+  // ---------------------------------------------------------------------------
+  // FPU  (instance name "fpu" required by autograder)
+  // ---------------------------------------------------------------------------
+  fpu fpu (
+      .clk        (clk),
+      .reset      (reset),
+      .valid_in   (fpu_en && (fpu_is_add || fpu_is_sub || fpu_is_mul || fpu_is_div)),
+      .a          (fpu_a),
+      .b          (fpu_b),
+      .op         (fpu_sel),
+      .rob_tag_in (fpu_rtag),
+      .valid_out  (fpu_vout),
+      .result     (fpu_res),
+      .rob_tag_out(fpu_tout)
+  );
+
+  // ---------------------------------------------------------------------------
+  // MEMORY  (instance name "memory" required by autograder)
   // ---------------------------------------------------------------------------
   reg [63:0] pc_reg;
   wire [31:0] mem_i0, mem_i1;
-  // lsq mem connections (driven from sequential block)
-  reg [63:0] lsq_maddr;
-  reg [63:0] lsq_mwdata;
-  reg lsq_mwe;
+  reg  [63:0] lsq_maddr;
+  reg  [63:0] lsq_mwdata;
+  reg         lsq_mwe;
   wire [63:0] lsq_mrdata;
 
   memory #(
       .MEM_SIZE(`MEM_SIZE)
   ) memory (
-      .clk(clk),
+      .clk        (clk),
       .fetch_addr0(pc_reg),
       .fetch_addr1(pc_reg + 64'd4),
-      .instr_out0(mem_i0),
-      .instr_out1(mem_i1),
-      .data_addr(lsq_maddr),
-      .write_data(lsq_mwdata),
-      .we(lsq_mwe),
-      .read_data(lsq_mrdata)
+      .instr_out0 (mem_i0),
+      .instr_out1 (mem_i1),
+      .data_addr  (lsq_maddr),
+      .write_data (lsq_mwdata),
+      .we         (lsq_mwe),
+      .read_data  (lsq_mrdata)
   );
 
   // ---------------------------------------------------------------------------
-  // REG_FILE (instance name: reg_file — required by autograder)
-  // Architectural register file; driven at commit. Read ports tied off since
-  // reads are done directly from arch_rf array for flush recovery.
+  // REG_FILE  (instance name "reg_file" required by autograder)
   // ---------------------------------------------------------------------------
   reg [63:0] rf_commit_data;
   reg [ 4:0] rf_commit_waddr;
@@ -306,51 +299,51 @@ fpu fpu (
   // DECODERS (combinational)
   // ---------------------------------------------------------------------------
   decoder u_d0 (
-      .instr(dq_i0),
-      .raddr1(d0_rs),
-      .raddr2(d0_rt),
-      .waddr(d0_rd),
-      .immediate(d0_imm),
-      .op(d0_op),
-      .use_imm(d0_uimm),
-      .write(d0_wr),
-      .is_load(d0_ld),
-      .is_store(d0_st),
-      .is_branch(d0_br),
-      .is_brgt(d0_brgt),
-      .is_jump(d0_jmp),
+      .instr     (dq_i0),
+      .raddr1    (d0_rs),
+      .raddr2    (d0_rt),
+      .waddr     (d0_rd),
+      .immediate (d0_imm),
+      .op        (d0_op),
+      .use_imm   (d0_uimm),
+      .write     (d0_wr),
+      .is_load   (d0_ld),
+      .is_store  (d0_st),
+      .is_branch (d0_br),
+      .is_brgt   (d0_brgt),
+      .is_jump   (d0_jmp),
       .is_brr_reg(d0_brrr),
       .is_brr_imm(d0_brri),
-      .is_return(d0_ret),
-      .is_call(d0_call),
-      .is_halt(d0_hlt),
+      .is_return (d0_ret),
+      .is_call   (d0_call),
+      .is_halt   (d0_hlt),
       .is_mov_reg(d0_mvr),
       .is_mov_imm(d0_mvi),
-      .rt_addr(d0_rtx)
+      .rt_addr   (d0_rtx)
   );
 
   decoder u_d1 (
-      .instr(dq_i1),
-      .raddr1(d1_rs),
-      .raddr2(d1_rt),
-      .waddr(d1_rd),
-      .immediate(d1_imm),
-      .op(d1_op),
-      .use_imm(d1_uimm),
-      .write(d1_wr),
-      .is_load(d1_ld),
-      .is_store(d1_st),
-      .is_branch(d1_br),
-      .is_brgt(d1_brgt),
-      .is_jump(d1_jmp),
+      .instr     (dq_i1),
+      .raddr1    (d1_rs),
+      .raddr2    (d1_rt),
+      .waddr     (d1_rd),
+      .immediate (d1_imm),
+      .op        (d1_op),
+      .use_imm   (d1_uimm),
+      .write     (d1_wr),
+      .is_load   (d1_ld),
+      .is_store  (d1_st),
+      .is_branch (d1_br),
+      .is_brgt   (d1_brgt),
+      .is_jump   (d1_jmp),
       .is_brr_reg(d1_brrr),
       .is_brr_imm(d1_brri),
-      .is_return(d1_ret),
-      .is_call(d1_call),
-      .is_halt(d1_hlt),
+      .is_return (d1_ret),
+      .is_call   (d1_call),
+      .is_halt   (d1_hlt),
       .is_mov_reg(d1_mvr),
       .is_mov_imm(d1_mvi),
-      .rt_addr(d1_rtx)
+      .rt_addr   (d1_rtx)
   );
 
   // ---------------------------------------------------------------------------
@@ -358,33 +351,31 @@ fpu fpu (
   // ---------------------------------------------------------------------------
   // cdb0: int alu result
   wire                c0en = alu_vout;
-  wire [  PHYS_W-1:0] c0pd;  // from 1-cycle alu pd pipe (registered below)
-  wire [        63:0] c0val;  // mov_reg: forward vs; else: alu result
+  wire [  PHYS_W-1:0] c0pd;
+  wire [        63:0] c0val;
   wire [ROB_BITS-1:0] c0rob = alu_tout[ROB_BITS-1:0];
 
   reg  [  PHYS_W-1:0] alu_pd_p1;
   reg  [        63:0] alu_vs_p1;
   reg alu_imovr_p1, alu_imovi_p1;
+
   always @(posedge clk) begin
     alu_pd_p1    <= alu_pd;
-    alu_vs_p1    <= alu_a; // save a (= vs for mov_reg)
+    alu_vs_p1    <= alu_a;
     alu_imovr_p1 <= alu_imovr_p;
     alu_imovi_p1 <= alu_imovi_p;
   end
+
   assign c0pd  = alu_pd_p1;
   assign c0val = alu_imovr_p1 ? alu_vs_p1 : alu_res;
 
-  // actual branch result (computed from alu pipe side-channel)
   wire alu_act_taken = alu_imovr_p1 ? 1'b0 : alu_ibr_p ? alu_res[0] : alu_ijmp_p ? 1'b1 : 1'b0;
-  wire [63:0] alu_act_tgt = alu_ibrimm_p ? (alu_pc_p + alu_b) :  // brr imm: pc + imm
-  alu_ibrreg_p ? (alu_pc_p + alu_vs_p) :  // brr reg: pc + rs
-  alu_vs_p;  // absolute
+  wire [63:0] alu_act_tgt = alu_ibrimm_p ? (alu_pc_p + alu_b)
+                           : alu_ibrreg_p ? (alu_pc_p + alu_vs_p)
+                           : alu_vs_p;
 
-  // cdb1: fp or load
-  wire fp_done = as_vout || ml_vout || dv_vout;
-  wire [63:0] fp_res = as_vout ? as_res : ml_vout ? ml_res : dv_res;
-  wire [ROB_BITS-1:0] fp_rtag = as_vout ? as_tout[ROB_BITS-1:0] :
-                               ml_vout ? ml_tout[ROB_BITS-1:0] : dv_tout[ROB_BITS-1:0];
+  // cdb1: fp (unified fpu output) or load
+  // NOTE: fp_pd tracks the physical dest through the 3-cycle fpu pipeline
   wire [PHYS_W-1:0] fp_pd = fp_pd_p[2];
 
   reg ld_done;
@@ -392,10 +383,11 @@ fpu fpu (
   reg [63:0] ld_val;
   reg [ROB_BITS-1:0] ld_rtag;
 
-  wire c1en = ld_done || fp_done;
+  // ld_done takes priority over fpu_vout on the same cycle (both rare)
+  wire c1en = ld_done || fpu_vout;
   wire [PHYS_W-1:0] c1pd = ld_done ? ld_pd : fp_pd;
-  wire [63:0] c1val = ld_done ? ld_val : fp_res;
-  wire [ROB_BITS-1:0] c1rob = ld_done ? ld_rtag : fp_rtag;
+  wire [63:0] c1val = ld_done ? ld_val : fpu_res;
+  wire [ROB_BITS-1:0] c1rob = ld_done ? ld_rtag : fpu_tout[ROB_BITS-1:0];
 
   // ---------------------------------------------------------------------------
   // STORE-TO-LOAD FORWARDING (combinational)
@@ -409,16 +401,15 @@ fpu fpu (
     fwd_hit = 0;
     fwd_val = 64'd0;
     for (sf = 0; sf < LSQ_SIZE; sf = sf + 1)
-    if(lsq_v[sf]&&lsq_st[sf]&&lsq_ardy[sf]&&lsq_drdy[sf]&&
-           (lsq_base[sf]+lsq_imm[sf]==lsq_h_addr))
-            begin
+    if (lsq_v[sf] && lsq_st[sf] && lsq_ardy[sf] && lsq_drdy[sf] &&
+          (lsq_base[sf] + lsq_imm[sf] == lsq_h_addr)) begin
       fwd_hit = 1;
       fwd_val = lsq_data[sf];
     end
   end
 
   // ---------------------------------------------------------------------------
-  // REDIRECT (registered, set by commit when mispredict detected)
+  // REDIRECT
   // ---------------------------------------------------------------------------
   reg redirect_en;
   reg [63:0] redirect_pc;
@@ -428,7 +419,6 @@ fpu fpu (
   // ---------------------------------------------------------------------------
   integer i, j;
 
-  // combinational helpers: free slot finders
   integer rs_free_slot, fp_free_slot;
   always @(*) begin
     rs_free_slot = 0;
@@ -437,7 +427,6 @@ fpu fpu (
     for (i = RS_FP - 1; i >= 0; i = i - 1) if (!fp_v[i]) fp_free_slot = i;
   end
 
-  // combinational: first ready rs entry (issue candidate)
   integer rs_iss_idx;
   reg rs_iss_found;
   always @(*) begin
@@ -462,13 +451,12 @@ fpu fpu (
     end
   end
 
-  // lsq mem drive
   always @(*) begin
     lsq_mwe    = 0;
     lsq_maddr  = lsq_h_addr;
     lsq_mwdata = lsq_data[lsq_head];
-    if(lsq_cnt>0 && lsq_v[lsq_head] && lsq_ardy[lsq_head] &&
-       lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head])
+    if (lsq_cnt > 0 && lsq_v[lsq_head] && lsq_ardy[lsq_head] &&
+        lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head])
       lsq_mwe = 1;
   end
 
@@ -493,7 +481,6 @@ fpu fpu (
       fl_head     <= 0;
       fl_tail     <= 32;
       fl_cnt      <= 32;
-      // init arch regs to 0, r31 = MEM_SIZE
       for (i = 0; i < 32; i = i + 1) begin
         arch_rf[i] = 64'd0;
         rat_map[i] = i[PHYS_W-1:0];
@@ -503,7 +490,7 @@ fpu fpu (
       arch_rf[31] = 64'd524288;
       prf[31]     = 64'd524288;
       for (i = 32; i < NPHYS; i = i + 1) begin
-        prf[i] = 0;
+        prf[i]     = 0;
         prf_rdy[i] = 1;
       end
       for (i = 0; i < 32; i = i + 1) free_list[i] = 6'(32 + i);
@@ -514,43 +501,39 @@ fpu fpu (
       for (i = 0; i < RS_INT; i = i + 1) rs_v[i] = 0;
       for (i = 0; i < RS_FP; i = i + 1) fp_v[i] = 0;
       for (i = 0; i < LSQ_SIZE; i = i + 1) lsq_v[i] = 0;
-      alu_pd_p1 <= 0;
-      alu_vs_p1 <= 0;
-      alu_imovr_p1 <= 0;
-      alu_imovi_p1 <= 0;
-      fp_pd_p[0] <= 0;
-      fp_pd_p[1] <= 0;
-      fp_pd_p[2] <= 0;
-      // alu side-channel regs
-      alu_vs_p <= 0;
-      alu_pc_p <= 0;
-      alu_ibr_p <= 0;
-      alu_ibgt_p <= 0;
-      alu_ijmp_p <= 0;
-      alu_ibrreg_p <= 0;
-      alu_ibrimm_p <= 0;
-      alu_imovr_p <= 0;
-      alu_imovi_p <= 0;
-      alu_ptaken_p <= 0;
-      alu_ptgt_p <= 0;
-      // reg_file commit signals
+      alu_pd_p1       <= 0;
+      alu_vs_p1       <= 0;
+      alu_imovr_p1    <= 0;
+      alu_imovi_p1    <= 0;
+      fp_pd_p[0]      <= 0;
+      fp_pd_p[1]      <= 0;
+      fp_pd_p[2]      <= 0;
+      alu_vs_p        <= 0;
+      alu_pc_p        <= 0;
+      alu_ibr_p       <= 0;
+      alu_ibgt_p      <= 0;
+      alu_ijmp_p      <= 0;
+      alu_ibrreg_p    <= 0;
+      alu_ibrimm_p    <= 0;
+      alu_imovr_p     <= 0;
+      alu_imovi_p     <= 0;
+      alu_ptaken_p    <= 0;
+      alu_ptgt_p      <= 0;
       rf_commit_wen   <= 0;
       rf_commit_waddr <= 0;
       rf_commit_data  <= 0;
     end else begin
 
-      // clear one-shot signals
-      redirect_en     <= 0;
-      alu_en          <= 0;
-      fpu_en          <= 0;
-      ld_done         <= 0;
-      rf_commit_wen   <= 0;
+      redirect_en   <= 0;
+      alu_en        <= 0;
+      fpu_en        <= 0;
+      ld_done       <= 0;
+      rf_commit_wen <= 0;
 
       // ================================================================
-      // A. CDB BROADCAST — write results, wake waiters, update rob
+      // A. CDB BROADCAST
       // ================================================================
 
-      // cdb0: int alu
       if (c0en) begin
         prf[c0pd]         <= c0val;
         prf_rdy[c0pd]     <= 1;
@@ -595,7 +578,6 @@ fpu fpu (
         end
       end
 
-      // cdb1: load or fp
       if (c1en) begin
         prf[c1pd]         <= c1val;
         prf_rdy[c1pd]     <= 1;
@@ -649,7 +631,6 @@ fpu fpu (
         if (rob_cnt > 0 && rob_valid[ch] && rob_done[ch]) begin
           do_commit = 1;
 
-          // write arch reg + drive reg_file instance
           if (rob_has_dest[ch]) begin
             arch_rf[rob_arch[ch]] <= rob_result[ch];
             rf_commit_data        <= rob_result[ch];
@@ -657,26 +638,22 @@ fpu fpu (
             rf_commit_wen         <= 1;
           end
 
-          // halt
           if (rob_is_halt[ch]) hlt <= 1;
 
-          // free old phys reg
           if (rob_has_dest[ch]) begin
             free_list[fl_tail] <= rob_old[ch];
             fl_tail <= fl_tail + 1;
             fl_cnt <= fl_cnt + 1;
           end
 
-          // store: mark committed so lsq can drain
           if (rob_is_store[ch]) begin
             for (i = 0; i < LSQ_SIZE; i = i + 1)
             if (lsq_v[i] && lsq_st[i] && lsq_rob[i] == ch) lsq_cmt[i] <= 1;
           end
 
-          // branch/jump check
           if (rob_is_branch[ch] || rob_is_jump[ch]) begin
-            if(rob_pred_taken[ch] != rob_act_taken[ch] ||
-                       (rob_act_taken[ch] && rob_pred_tgt[ch]!=rob_act_tgt[ch])) begin
+            if (rob_pred_taken[ch] != rob_act_taken[ch] ||
+                (rob_act_taken[ch] && rob_pred_tgt[ch] != rob_act_tgt[ch])) begin
               do_flush = 1;
               redirect_en <= 1;
               redirect_pc <= rob_act_taken[ch] ? rob_act_tgt[ch] : (rob_pc[ch] + 64'd4);
@@ -684,12 +661,11 @@ fpu fpu (
           end
 
           rob_valid[ch] <= 0;
-          rob_done[ch] <= 0;
-          rob_head <= ch + 1;
-          rob_cnt <= rob_cnt - 1;
+          rob_done[ch]  <= 0;
+          rob_head      <= ch + 1;
+          rob_cnt       <= rob_cnt - 1;
 
           if (do_flush) begin
-            // squash everything in flight
             for (i = 0; i < RS_INT; i = i + 1) rs_v[i] <= 0;
             for (i = 0; i < RS_FP; i = i + 1) fp_v[i] <= 0;
             for (i = 0; i < LSQ_SIZE; i = i + 1) lsq_v[i] <= 0;
@@ -698,7 +674,6 @@ fpu fpu (
               rob_valid[i] <= 0;
               rob_done[i]  <= 0;
             end
-            // restore rat to identity (arch state is correct after commit)
             for (i = 0; i < 32; i = i + 1) begin
               rat_map[i] <= i[PHYS_W-1:0];
               prf[i]     <= arch_rf[i];
@@ -706,20 +681,19 @@ fpu fpu (
             end
             prf[31] <= arch_rf[31];
             for (i = 32; i < NPHYS; i = i + 1) prf_rdy[i] <= 1;
-            // reset free list
             for (i = 0; i < 32; i = i + 1) free_list[i] <= 6'(32 + i);
-            fl_head <= 0;
-            fl_tail <= 32;
-            fl_cnt <= 32;
+            fl_head  <= 0;
+            fl_tail  <= 32;
+            fl_cnt   <= 32;
             rob_tail <= ch + 1;
             rob_cnt  <= 0;
             rs_cnt   <= 0;
-            fp_cnt  <= 0;
+            fp_cnt   <= 0;
             lsq_head <= 0;
-            lsq_tail<= 0;
-            lsq_cnt <= 0;
+            lsq_tail <= 0;
+            lsq_cnt  <= 0;
             dq_v0    <= 0;
-            dq_v1   <= 0;
+            dq_v1    <= 0;
           end
         end
       end  // commit_blk
@@ -729,16 +703,14 @@ fpu fpu (
       // ================================================================
       if (!redirect_en && lsq_cnt > 0 && lsq_v[lsq_head] && lsq_ardy[lsq_head]) begin
         if (lsq_ld[lsq_head]) begin
-          // load: forward or read mem
           ld_done  <= 1;
           ld_pd    <= lsq_pd[lsq_head];
           ld_rtag  <= lsq_rob[lsq_head];
           ld_val   <= fwd_hit ? fwd_val : lsq_mrdata;
           lsq_v[lsq_head] <= 0;
-          lsq_head <= lsq_head+1;
-          lsq_cnt  <= lsq_cnt-1;
+          lsq_head <= lsq_head + 1;
+          lsq_cnt  <= lsq_cnt  - 1;
         end else if (lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head]) begin
-          // store: mem_we driven combinationally; just retire
           lsq_v[lsq_head] <= 0;
           lsq_head <= lsq_head + 1;
           lsq_cnt <= lsq_cnt - 1;
@@ -749,55 +721,48 @@ fpu fpu (
       // D. FU ISSUE
       // ================================================================
       if (!redirect_en) begin
-        // int alu issue
         if (rs_iss_found) begin
-          alu_en   <= 1;
-          alu_op   <= rs_op[rs_iss_idx];
-          alu_a    <= rs_vs[rs_iss_idx];
-          alu_b    <= rs_uimm[rs_iss_idx] ? rs_imm[rs_iss_idx] : rs_vt[rs_iss_idx];
-          alu_rtag <= rs_rob[rs_iss_idx];
-          alu_pd   <= rob_phys[rs_rob[rs_iss_idx]];
-          // side-channel
-          alu_vs_p    <= rs_vs[rs_iss_idx];
-          alu_pc_p    <= rs_pc[rs_iss_idx];
-          alu_ibr_p   <= rs_ibr[rs_iss_idx];
-          alu_ibgt_p  <= rs_ibgt[rs_iss_idx];
-          alu_ijmp_p  <= rs_ijmp[rs_iss_idx];
-          alu_ibrreg_p<= rs_ibrreg[rs_iss_idx];
-          alu_ibrimm_p<= rs_ibrimm[rs_iss_idx];
-          alu_imovr_p <= rs_imovr[rs_iss_idx];
-          alu_imovi_p <= rs_imovi[rs_iss_idx];
-          alu_ptaken_p<= rs_ptaken[rs_iss_idx];
-          alu_ptgt_p  <= rs_ptgt[rs_iss_idx];
+          alu_en           <= 1;
+          alu_op           <= rs_op[rs_iss_idx];
+          alu_a            <= rs_vs[rs_iss_idx];
+          alu_b            <= rs_uimm[rs_iss_idx] ? rs_imm[rs_iss_idx] : rs_vt[rs_iss_idx];
+          alu_rtag         <= {1'b0, rs_rob[rs_iss_idx]};  // zero-extend 5->6 bits
+          alu_pd           <= rob_phys[rs_rob[rs_iss_idx]];
+          alu_vs_p         <= rs_vs[rs_iss_idx];
+          alu_pc_p         <= rs_pc[rs_iss_idx];
+          alu_ibr_p        <= rs_ibr[rs_iss_idx];
+          alu_ibgt_p       <= rs_ibgt[rs_iss_idx];
+          alu_ijmp_p       <= rs_ijmp[rs_iss_idx];
+          alu_ibrreg_p     <= rs_ibrreg[rs_iss_idx];
+          alu_ibrimm_p     <= rs_ibrimm[rs_iss_idx];
+          alu_imovr_p      <= rs_imovr[rs_iss_idx];
+          alu_imovi_p      <= rs_imovi[rs_iss_idx];
+          alu_ptaken_p     <= rs_ptaken[rs_iss_idx];
+          alu_ptgt_p       <= rs_ptgt[rs_iss_idx];
           rs_v[rs_iss_idx] <= 0;
-          rs_cnt <= rs_cnt - 1;
+          rs_cnt           <= rs_cnt - 1;
         end
-        // fp issue
         if (fp_iss_found) begin
           fpu_en   <= 1;
           fpu_op   <= fp_op[fp_iss_idx];
           fpu_a    <= fp_vs[fp_iss_idx];
           fpu_b    <= fp_vt[fp_iss_idx];
-          fpu_rtag <= fp_rob[fp_iss_idx];
+          fpu_rtag <= {1'b0, fp_rob[fp_iss_idx]};  // zero-extend 5->6 bits
           fpu_pd   <= rob_phys[fp_rob[fp_iss_idx]];
           fp_v[fp_iss_idx] <= 0;
           fp_cnt <= fp_cnt - 1;
         end
       end
 
-      // fp pd shift register (3 cycles to match fp pipeline latency)
+      // fp pd shift register (3 cycles = fpu pipeline depth)
       fp_pd_p[0] <= fpu_pd;
       fp_pd_p[1] <= fp_pd_p[0];
       fp_pd_p[2] <= fp_pd_p[1];
 
       // ================================================================
       // E. DISPATCH + RENAME
-      // Two instrs dispatched simultaneously; manage counters carefully.
-      // All counter updates in this block are computed as deltas and
-      // written exactly once.
       // ================================================================
       if (!redirect_en) begin : dispatch_blk
-        // local rename results
         reg [PHYS_W-1:0] p0_new, p0_old, p0_ps, p0_pt;
         reg [63:0] p0_vs, p0_vt;
         reg p0_psrdy, p0_ptrdy;
@@ -808,17 +773,15 @@ fpu fpu (
         reg p1_psrdy, p1_ptrdy;
         reg [ROB_BITS-1:0] p1_rob;
 
-        // track running offsets within this dispatch cycle
-        reg [         5:0] fh;  // fl_head after d0 alloc
-        reg [         6:0] fc;  // fl_cnt  after d0 alloc
-        reg [ROB_BITS-1:0] rt;  // rob_tail after d0 alloc
-        reg [  ROB_BITS:0] rc;  // rob_cnt  after d0 alloc
-        reg [         3:0] rsc;  // rs_cnt   after d0 alloc
-        reg [         2:0] fpc;  // fp_cnt   after d0 alloc
-        reg [         4:0] lc;  // lsq_cnt  after d0 alloc
-        reg [         3:0] lt;  // lsq_tail after d0 alloc
+        reg [5:0] fh;
+        reg [6:0] fc;
+        reg [ROB_BITS-1:0] rt;
+        reg [ROB_BITS:0] rc;
+        reg [3:0] rsc;
+        reg [2:0] fpc;
+        reg [4:0] lc;
+        reg [3:0] lt;
 
-        // initialise running state from current (pre-cycle) values
         fh  = fl_head;
         fc  = fl_cnt;
         rt  = rob_tail;
@@ -830,15 +793,13 @@ fpu fpu (
 
         // -------- instr 0 --------
         if (d0_en) begin
-          // rename sources
-          p0_ps = rat_map[d0_rs];
-          p0_pt = rat_map[d0_rt];
-          p0_vs = prf[p0_ps];
-          p0_vt = prf[p0_pt];
+          p0_ps    = rat_map[d0_rs];
+          p0_pt    = rat_map[d0_rt];
+          p0_vs    = prf[p0_ps];
+          p0_vt    = prf[p0_pt];
           p0_psrdy = prf_rdy[p0_ps];
           p0_ptrdy = prf_rdy[p0_pt];
 
-          // allocate dest
           if (d0_wr && fc > 0) begin
             p0_new = free_list[fh];
             p0_old = rat_map[d0_rd];
@@ -851,7 +812,6 @@ fpu fpu (
             p0_old = rat_map[d0_rd];
           end
 
-          // alloc rob
           p0_rob = rt;
           rt = rt + 1;
           rc = rc + 1;
@@ -871,7 +831,6 @@ fpu fpu (
           rob_act_taken[p0_rob]  <= 0;
           rob_act_tgt[p0_rob]    <= 0;
 
-          // dispatch to functional unit
           if (d0_mem) begin
             lsq_v[lt]    <= 1;
             lsq_ld[lt]   <= d0_ld;
@@ -889,15 +848,15 @@ fpu fpu (
             lt = lt + 1;
             lc = lc + 1;
           end else if (d0_fp) begin
-            fp_v[fp_free_slot]    <= 1;
-            fp_op[fp_free_slot]   <= d0_op;
-            fp_ps[fp_free_slot]   <= p0_ps;
-            fp_pt[fp_free_slot]   <= p0_pt;
-            fp_psrdy[fp_free_slot]<= p0_psrdy;
-            fp_ptrdy[fp_free_slot]<= p0_ptrdy;
-            fp_vs[fp_free_slot]   <= p0_vs;
-            fp_vt[fp_free_slot]   <= p0_vt;
-            fp_rob[fp_free_slot]  <= p0_rob;
+            fp_v[fp_free_slot]     <= 1;
+            fp_op[fp_free_slot]    <= d0_op;
+            fp_ps[fp_free_slot]    <= p0_ps;
+            fp_pt[fp_free_slot]    <= p0_pt;
+            fp_psrdy[fp_free_slot] <= p0_psrdy;
+            fp_ptrdy[fp_free_slot] <= p0_ptrdy;
+            fp_vs[fp_free_slot]    <= p0_vs;
+            fp_vt[fp_free_slot]    <= p0_vt;
+            fp_rob[fp_free_slot]   <= p0_rob;
             fpc = fpc + 1;
           end else if (!d0_hlt) begin
             rs_v[rs_free_slot]      <= 1;
@@ -927,11 +886,10 @@ fpu fpu (
 
         // -------- instr 1 --------
         if (d1_en) begin
-          // forward from d0 rename if same arch reg
-          p1_ps = (d0_en && d0_wr && d0_rd == d1_rs) ? p0_new : rat_map[d1_rs];
-          p1_pt = (d0_en && d0_wr && d0_rd == d1_rt) ? p0_new : rat_map[d1_rt];
-          p1_vs = prf[p1_ps];
-          p1_vt = prf[p1_pt];
+          p1_ps    = (d0_en && d0_wr && d0_rd == d1_rs) ? p0_new : rat_map[d1_rs];
+          p1_pt    = (d0_en && d0_wr && d0_rd == d1_rt) ? p0_new : rat_map[d1_rt];
+          p1_vs    = prf[p1_ps];
+          p1_vt    = prf[p1_pt];
           p1_psrdy = prf_rdy[p1_ps];
           p1_ptrdy = prf_rdy[p1_pt];
 
@@ -987,15 +945,15 @@ fpu fpu (
               reg [2:0] fslot;
               fslot = 0;
               for (j = RS_FP - 1; j >= 0; j = j - 1) if (!fp_v[j]) fslot = j[2:0];
-              fp_v[fslot]    <= 1;
-              fp_op[fslot]   <= d1_op;
-              fp_ps[fslot]   <= p1_ps;
-              fp_pt[fslot]   <= p1_pt;
-              fp_psrdy[fslot]<= p1_psrdy;
-              fp_ptrdy[fslot]<= p1_ptrdy;
-              fp_vs[fslot]   <= p1_vs;
-              fp_vt[fslot]   <= p1_vt;
-              fp_rob[fslot]  <= p1_rob;
+              fp_v[fslot]     <= 1;
+              fp_op[fslot]    <= d1_op;
+              fp_ps[fslot]    <= p1_ps;
+              fp_pt[fslot]    <= p1_pt;
+              fp_psrdy[fslot] <= p1_psrdy;
+              fp_ptrdy[fslot] <= p1_ptrdy;
+              fp_vs[fslot]    <= p1_vs;
+              fp_vt[fslot]    <= p1_vt;
+              fp_rob[fslot]   <= p1_rob;
               fpc = fpc + 1;
             end
           end else if (!d1_hlt) begin
@@ -1029,7 +987,6 @@ fpu fpu (
           end
         end
 
-        // commit final counter values (single write each)
         fl_head  <= fh;
         fl_cnt   <= fc;
         rob_tail <= rt;
@@ -1059,10 +1016,5 @@ fpu fpu (
 
     end  // !reset
   end  // always
-
-  // ---------------------------------------------------------------------------
-  // ALU SIDE-CHANNEL PIPELINE REG (catches issue signals 1 cycle before result)
-  // already driven inside always block above; extra regs declared at top
-  // ---------------------------------------------------------------------------
 
 endmodule
