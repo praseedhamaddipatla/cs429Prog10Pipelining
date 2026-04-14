@@ -853,7 +853,7 @@ module tinker_core (
       // ================================================================
       // E. DISPATCH + RENAME
       // ================================================================
-      if (!redirect_en) begin : dispatch_blk
+      if (!redirect_en && !call_pending && !ret_pending) begin : dispatch_blk
         reg [PHYS_W-1:0] p0_new, p0_old, p0_ps, p0_pt;
         reg [63:0]        p0_vs,  p0_vt;
         reg               p0_psrdy, p0_ptrdy;
@@ -1146,10 +1146,12 @@ module tinker_core (
       // ================================================================
       // F. FETCH / DECODE QUEUE
       // ================================================================
-      if (redirect_en) begin
+      if (redirect_en || call_pending || ret_pending) begin
+        // On redirect: update PC. On pending: stall fetch so no new
+        // instructions enter the decode queue while we're redirecting.
         dq_v0  <= 0;
         dq_v1  <= 0;
-        pc_reg <= redirect_pc;
+        if (redirect_en) pc_reg <= redirect_pc;
       end else if (!stall && !hlt) begin
         dq_v0  <= 1;
         dq_i0  <= mem_i0;
