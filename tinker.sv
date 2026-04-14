@@ -146,6 +146,12 @@ module tinker_core (
   reg [4:0] lsq_cnt;
   wire lsq_full = (lsq_cnt >= LSQ_SIZE - 2); // -2: call uses 2 LSQ slots
 
+  // Whether an LSQ entry executes this cycle (load fires OR committed store fires).
+  // Used to fold the lsq_cnt decrement into a single NBA in dispatch_blk.
+  wire lsq_exec = !redirect_en && lsq_cnt > 0 && lsq_v[lsq_head] && lsq_ardy[lsq_head] &&
+                  (lsq_ld[lsq_head] ||
+                   (lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head]));
+
   // ---------------------------------------------------------------------------
   // DECODE QUEUE
   // ---------------------------------------------------------------------------
@@ -792,11 +798,11 @@ module tinker_core (
           ld_isret         <= lsq_isret[lsq_head];
           lsq_v[lsq_head]  <= 0;
           lsq_head         <= lsq_head + 1;
-          lsq_cnt          <= lsq_cnt  - 1;
+          // lsq_cnt decremented via combined NBA in dispatch_blk below
         end else if (lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head]) begin
           lsq_v[lsq_head]  <= 0;
           lsq_head         <= lsq_head + 1;
-          lsq_cnt          <= lsq_cnt  - 1;
+          // lsq_cnt decremented via combined NBA in dispatch_blk below
         end
       end
 
@@ -1102,15 +1108,15 @@ module tinker_core (
         rs_cnt   <= rsc - (rs_iss_found ? 4'd1 : 4'd0);
         fp_cnt   <= fpc - (fp_iss_found ? 3'd1 : 3'd0);
         lsq_tail <= lt;
-        lsq_cnt  <= lc;
+        lsq_cnt  <= lc - (lsq_exec ? 5'd1 : 5'd0);
       end // dispatch_blk
 
-      // When dispatch_blk is skipped (call/ret pending) but issue still fires,
-      // the fp_cnt/rs_cnt still need to decrement. Redirect blocks both,
-      // but call/ret pending only blocks dispatch.
+      // When dispatch_blk is skipped (call/ret pending) but issue/LSQ still fires,
+      // the fp_cnt/rs_cnt/lsq_cnt still need to decrement.
       if ((call_pending || ret_pending) && !redirect_en) begin
         if (rs_iss_found) rs_cnt <= rs_cnt - 1;
         if (fp_iss_found) fp_cnt <= fp_cnt - 1;
+        if (lsq_exec)     lsq_cnt <= lsq_cnt - 1;
       end
 
       // ================================================================
