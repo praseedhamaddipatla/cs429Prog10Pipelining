@@ -800,59 +800,6 @@ module tinker_core (
         end
       end
 
-      // ================================================================
-      // D. FU ISSUE
-      // ================================================================
-      if (!redirect_en) begin
-        if (rs_iss_found) begin
-          alu_en       <= 1;
-          alu_op       <= rs_op[rs_iss_idx];
-          // For mov_reg  : a = src, b = don't-care
-          // For call/ret : a = src (jump target), b = don't-care
-          // For brr_reg  : a = rs value (offset), b = don't-care
-          // For brr_imm  : a = don't-care, b = imm (offset)
-          // For brnz/brgt: a = compare operand(s), b = operand-b
-          // For br abs   : a = target reg value
-          alu_a        <= rs_vs[rs_iss_idx];
-          alu_b        <= rs_uimm[rs_iss_idx] ? rs_imm[rs_iss_idx] : rs_vt[rs_iss_idx];
-          alu_rtag     <= {1'b0, rs_rob[rs_iss_idx]};
-          alu_pd       <= rob_phys[rs_rob[rs_iss_idx]];
-          alu_vs_p     <= rs_vs[rs_iss_idx];
-          alu_pc_p     <= rs_pc[rs_iss_idx];
-          alu_ibr_p    <= rs_ibr[rs_iss_idx];
-          alu_ibgt_p   <= rs_ibgt[rs_iss_idx];
-          alu_ijmp_p   <= rs_ijmp[rs_iss_idx];
-          alu_ibrreg_p <= rs_ibrreg[rs_iss_idx];
-          alu_ibrimm_p <= rs_ibrimm[rs_iss_idx];
-          alu_imovr_p  <= rs_imovr[rs_iss_idx];
-          alu_imovi_p  <= rs_imovi[rs_iss_idx];
-          alu_ical_p   <= rs_ical[rs_iss_idx];
-          alu_iret_p   <= rs_iret[rs_iss_idx];
-          alu_ptaken_p <= rs_ptaken[rs_iss_idx];
-          alu_ptgt_p   <= rs_ptgt[rs_iss_idx];
-          rs_v[rs_iss_idx] <= 0;
-          rs_cnt       <= rs_cnt - 1;
-        end
-        if (fp_iss_found) begin
-          fpu_en   <= 1;
-          fpu_op   <= fp_op[fp_iss_idx];
-          fpu_a    <= fp_vs[fp_iss_idx];
-          fpu_b    <= fp_vt[fp_iss_idx];
-          fpu_rtag <= {1'b0, fp_rob[fp_iss_idx]};
-          fpu_pd   <= rob_phys[fp_rob[fp_iss_idx]];
-          fp_v[fp_iss_idx] <= 0;
-          fp_cnt   <= fp_cnt - 1;
-        end
-      end
-
-      // fp pd shift register (3 cycles = fpu pipeline depth)
-      fp_pd_p[0] <= fpu_pd;
-      fp_pd_p[1] <= fp_pd_p[0];
-      fp_pd_p[2] <= fp_pd_p[1];
-
-      // ================================================================
-      // E. DISPATCH + RENAME
-      // ================================================================
       if (!redirect_en && !call_pending && !ret_pending) begin : dispatch_blk
         reg [PHYS_W-1:0] p0_new, p0_old, p0_ps, p0_pt;
         reg [63:0]        p0_vs,  p0_vt;
@@ -1142,6 +1089,61 @@ module tinker_core (
         lsq_tail <= lt;
         lsq_cnt  <= lc;
       end // dispatch_blk
+
+      // (D moved after dispatch so issue NBAs win over dispatch's fp_cnt/rs_cnt NBAs)
+      // ================================================================
+      // D. FU ISSUE
+      // ================================================================
+      if (!redirect_en) begin
+        if (rs_iss_found) begin
+          alu_en       <= 1;
+          alu_op       <= rs_op[rs_iss_idx];
+          // For mov_reg  : a = src, b = don't-care
+          // For call/ret : a = src (jump target), b = don't-care
+          // For brr_reg  : a = rs value (offset), b = don't-care
+          // For brr_imm  : a = don't-care, b = imm (offset)
+          // For brnz/brgt: a = compare operand(s), b = operand-b
+          // For br abs   : a = target reg value
+          alu_a        <= rs_vs[rs_iss_idx];
+          alu_b        <= rs_uimm[rs_iss_idx] ? rs_imm[rs_iss_idx] : rs_vt[rs_iss_idx];
+          alu_rtag     <= {1'b0, rs_rob[rs_iss_idx]};
+          alu_pd       <= rob_phys[rs_rob[rs_iss_idx]];
+          alu_vs_p     <= rs_vs[rs_iss_idx];
+          alu_pc_p     <= rs_pc[rs_iss_idx];
+          alu_ibr_p    <= rs_ibr[rs_iss_idx];
+          alu_ibgt_p   <= rs_ibgt[rs_iss_idx];
+          alu_ijmp_p   <= rs_ijmp[rs_iss_idx];
+          alu_ibrreg_p <= rs_ibrreg[rs_iss_idx];
+          alu_ibrimm_p <= rs_ibrimm[rs_iss_idx];
+          alu_imovr_p  <= rs_imovr[rs_iss_idx];
+          alu_imovi_p  <= rs_imovi[rs_iss_idx];
+          alu_ical_p   <= rs_ical[rs_iss_idx];
+          alu_iret_p   <= rs_iret[rs_iss_idx];
+          alu_ptaken_p <= rs_ptaken[rs_iss_idx];
+          alu_ptgt_p   <= rs_ptgt[rs_iss_idx];
+          rs_v[rs_iss_idx] <= 0;
+          rs_cnt       <= rs_cnt - 1;
+        end
+        if (fp_iss_found) begin
+          fpu_en   <= 1;
+          fpu_op   <= fp_op[fp_iss_idx];
+          fpu_a    <= fp_vs[fp_iss_idx];
+          fpu_b    <= fp_vt[fp_iss_idx];
+          fpu_rtag <= {1'b0, fp_rob[fp_iss_idx]};
+          fpu_pd   <= rob_phys[fp_rob[fp_iss_idx]];
+          fp_v[fp_iss_idx] <= 0;
+          fp_cnt   <= fp_cnt - 1;
+        end
+      end
+
+      // fp pd shift register (3 cycles = fpu pipeline depth)
+      fp_pd_p[0] <= fpu_pd;
+      fp_pd_p[1] <= fp_pd_p[0];
+      fp_pd_p[2] <= fp_pd_p[1];
+
+      // ================================================================
+      // E. DISPATCH + RENAME
+      // ================================================================
 
       // ================================================================
       // F. FETCH / DECODE QUEUE
