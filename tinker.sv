@@ -537,16 +537,16 @@ module tinker_core (
       fl_cnt        <= 32;
 
       for (i = 0; i < 32; i = i+1) begin
-        // Use blocking (=) so values are visible immediately on cycle 1.
-        // reg_file.registers[] is loaded by the testbench before reset deasserts,
-        // so reading it here captures the correct initial architectural state.
-        arch_rf[i]  = reg_file.registers[i];
+        // Initialise to 0; prf_sync will pick up testbench-loaded values
+        // on the first active cycle (cycle 1), before dispatch (cycle 2).
+        // Do NOT read reg_file.registers[] here: reg_file's own reset fires
+        // via non-blocking assignments at the same posedge, so we would read
+        // stale values from the previous test run.
+        arch_rf[i]  = 64'd0;
         rat_map[i]  = i[PHYS_W-1:0];
-        prf[i]      = reg_file.registers[i];
+        prf[i]      = 64'd0;
         prf_rdy[i]  = 1;
       end
-      // r31 override: reg_file resets r31 to 524288 at the same posedge,
-      // so read it directly rather than from the pre-reset stale value.
       arch_rf[31] = 64'd524288;
       prf[31]     = 64'd524288;
 
@@ -861,7 +861,11 @@ module tinker_core (
           p0_r31_val  = prf[p0_r31_phys];
           p0_r31_rdy  = prf_rdy[p0_r31_phys];
 
-          if (d0_wr && fc > 0) begin
+          // Allocate a new physical register for instructions that write a dest.
+          // Exception: call has write=1 in the original decoder but must NOT
+          // write any architectural register (the reference multicycle gates
+          // reg_we with !is_call_r). We handle call separately below.
+          if (d0_wr && !d0_call && fc > 0) begin
             p0_new = free_list[fh];
             p0_old = rat_map[d0_rd];
             fh     = fh + 1;
@@ -911,8 +915,12 @@ module tinker_core (
             lt = lt + 1;
             lc = lc + 1;
           end else if (d0_call) begin
-            // call rd: rd = pc+4 (link register), jump to rd_old, push pc+4 to mem[r31-8]
-            // RS entry: ical flag makes c0val = pc+4 instead of ALU result
+            // call: jump to rd, push pc+4 to mem[r31-8], NO register writeback.
+            // The original decoder sets write=1 and waddr=r31 but the reference
+            // multicycle guards reg_we with !is_call_r — so we force has_dest=0.
+            // rob_done=0: wait for ALU so we get act_taken/act_tgt for the jump.
+            rob_has_dest[p0_rob]   <= 0;   // override: call writes no register
+            rob_done[p0_rob]       <= 0;   // wait for ALU (ical) to set act_tgt
             rs_v[rs_free_slot]      <= 1;
             rs_op[rs_free_slot]     <= 5'd0;   // ADD placeholder
             rs_ps[rs_free_slot]     <= p0_ps;  // rd = jump target
@@ -1025,7 +1033,7 @@ module tinker_core (
           p1_r31_val  = prf[p1_r31_phys];
           p1_r31_rdy  = prf_rdy[p1_r31_phys];
 
-          if (d1_wr && fc > 0) begin
+          if (d1_wr && !d1_call && fc > 0) begin
             p1_new = free_list[fh];
             p1_old = (d0_en && d0_wr && d0_rd == d1_rd) ? p0_new : rat_map[d1_rd];
             fh     = fh + 1;
@@ -1074,6 +1082,8 @@ module tinker_core (
             lt = lt + 1;
             lc = lc + 1;
           end else if (d1_call) begin
+            rob_has_dest[p1_rob]   <= 0;
+            rob_done[p1_rob]       <= 0;
             begin : rs_slot1_call
               reg [3:0] rslot;
               rslot = 0;
