@@ -463,6 +463,15 @@ module tinker_core (
   reg        redirect_en;
   reg [63:0] redirect_pc;
 
+  // Call/return bypass registers — these handle call and return entirely outside
+  // the OOO pipeline, mirroring the multicycle processor's direct approach.
+  reg        call_pending;  // set for 1 cycle; memory write + redirect fires next cycle
+  reg [63:0] call_tgt;      // jump target (rd register value)
+  reg [63:0] call_addr;     // mem address = r31-8
+  reg [63:0] call_wdata;    // data to write = pc+4
+  reg        ret_pending;   // set for 1 cycle; memory read + redirect fires next cycle
+  reg [63:0] ret_addr;      // mem address = r31-8
+
   // ---------------------------------------------------------------------------
   // FREE-SLOT COMBINATIONAL LOGIC
   // ---------------------------------------------------------------------------
@@ -504,12 +513,22 @@ module tinker_core (
   // STORE WRITE-ENABLE (combinational)
   // ---------------------------------------------------------------------------
   always @(*) begin
-    lsq_mwe    = 0;
-    lsq_maddr  = lsq_h_addr;
-    lsq_mwdata = lsq_data[lsq_head];
-    if (lsq_cnt > 0 && lsq_v[lsq_head] && lsq_ardy[lsq_head] &&
-        lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head])
-      lsq_mwe = 1;
+    if (call_pending) begin
+      lsq_mwe    = 1;
+      lsq_maddr  = call_addr;
+      lsq_mwdata = call_wdata;
+    end else if (ret_pending) begin
+      lsq_mwe    = 0;
+      lsq_maddr  = ret_addr;
+      lsq_mwdata = 64'd0;
+    end else begin
+      lsq_mwe    = 0;
+      lsq_maddr  = lsq_h_addr;
+      lsq_mwdata = lsq_data[lsq_head];
+      if (lsq_cnt > 0 && lsq_v[lsq_head] && lsq_ardy[lsq_head] &&
+          lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head])
+        lsq_mwe = 1;
+    end
   end
 
   // ---------------------------------------------------------------------------
@@ -525,6 +544,8 @@ module tinker_core (
       alu_en        <= 0;
       fpu_en        <= 0;
       ld_done       <= 0;
+      call_pending  <= 0;
+      ret_pending   <= 0;
       rob_head      <= 0;
       rob_tail      <= 0;
       rob_cnt       <= 0;
@@ -587,6 +608,24 @@ module tinker_core (
       ld_done       <= 0;
       ld_isret      <= 0;
       rf_commit_wen <= 0;
+      call_pending  <= 0;  // pulse for exactly one cycle
+      ret_pending   <= 0;  // pulse for exactly one cycle
+
+      // ================================================================
+      // CALL / RETURN PENDING EXECUTION
+      // call_pending: memory write is active via combinational override this cycle.
+      //   Now set redirect to jump target.
+      // ret_pending: memory read at ret_addr is live on lsq_mrdata this cycle.
+      //   Redirect to the loaded value.
+      // ================================================================
+      if (call_pending) begin
+        redirect_en <= 1;
+        redirect_pc <= call_tgt;
+      end
+      if (ret_pending) begin
+        redirect_en <= 1;
+        redirect_pc <= lsq_mrdata;
+      end
 
       // ================================================================
       // CRITICAL: keep prf[0..31] in sync with reg_file.registers[]
@@ -882,16 +921,15 @@ module tinker_core (
           rt     = rt + 1;
           rc     = rc + 1;
           rob_valid[p0_rob]      <= 1;
-          // call: rob_done=0 until ALU writes pc+4; return: rob_done=0 until load
-          rob_done[p0_rob]       <= (!d0_wr || d0_hlt || d0_st || d0_ret) ? 1 : 0;
+          rob_done[p0_rob]       <= (!d0_wr || d0_hlt || d0_st) ? 1 : 0;
           rob_arch[p0_rob]       <= d0_rd;
           rob_phys[p0_rob]       <= p0_new;
           rob_old[p0_rob]        <= p0_old;
           rob_has_dest[p0_rob]   <= d0_wr;
-          rob_is_store[p0_rob]   <= d0_st || d0_call; // call also pushes to stack
+          rob_is_store[p0_rob]   <= d0_st;
           rob_is_halt[p0_rob]    <= d0_hlt;
           rob_is_branch[p0_rob]  <= d0_br;
-          rob_is_jump[p0_rob]    <= d0_jmp || d0_call || d0_ret;
+          rob_is_jump[p0_rob]    <= d0_jmp;
           rob_pc[p0_rob]         <= dq_pc0;
           rob_pred_taken[p0_rob] <= 0;
           rob_pred_tgt[p0_rob]   <= dq_pc0 + 64'd4;
@@ -916,51 +954,23 @@ module tinker_core (
             lt = lt + 1;
             lc = lc + 1;
           end else if (d0_call) begin
-            // call: jump to rd, push pc+4 to mem[r31-8], NO register writeback.
-            // Resolve the jump at dispatch time — target is p0_vs (rd value).
-            // No RS/ALU entry: avoids prf[r31] corruption from the ALU result path.
-            rob_has_dest[p0_rob]   <= 0;   // no register writeback
-            rob_done[p0_rob]       <= 1;   // ready immediately (no ALU needed)
-            rob_act_taken[p0_rob]  <= 1;   // call always jumps
-            rob_act_tgt[p0_rob]    <= p0_vs; // jump target = rd value
-            // LSQ store: push pc+4 to mem[r31-8]
-            lsq_v[lt]       <= 1;
-            lsq_ld[lt]      <= 0;
-            lsq_st[lt]      <= 1;
-            lsq_ardy[lt]    <= p0_r31_rdy;
-            lsq_drdy[lt]    <= 1;
-            lsq_cmt[lt]     <= 0;
-            lsq_base[lt]    <= p0_r31_val;
-            lsq_data[lt]    <= dq_pc0 + 64'd4;
-            lsq_imm[lt]     <= 64'hFFFFFFFFFFFFFFF8; // -8
-            lsq_ps[lt]      <= p0_r31_phys;
-            lsq_pt[lt]      <= p0_r31_phys;
-            lsq_pd[lt]      <= p0_new;
-            lsq_rob[lt]     <= p0_rob;
-            lsq_isret[lt]   <= 0;
-            lt = lt + 1;
-            lc = lc + 1;
+            // call: bypass OOO pipeline. Set pending flags for next-cycle execution.
+            // d0_ctrl ensures d1 is suppressed, so we safely stall the decode queue.
+            call_pending <= 1;
+            call_tgt     <= p0_vs;                              // rd = jump target
+            call_addr    <= p0_r31_val + 64'hFFFFFFFFFFFFFFF8; // r31 - 8
+            call_wdata   <= dq_pc0 + 64'd4;                    // pc + 4
+            // Undo the ROB slot we tentatively allocated above (rc was incremented)
+            rc = rc - 1;
+            rt = rt - 1;
+            rob_valid[p0_rob] <= 0;
           end else if (d0_ret) begin
-            // return: pc = mem[r31-8]. No dest register.
-            // Original decoder sets raddr1=0 (default), so p0_ps/p0_vs = r0 = 0.
-            // Always use p0_r31_* directly for the stack base.
-            rob_done[p0_rob] <= 0;
-            lsq_v[lt]        <= 1;
-            lsq_ld[lt]       <= 1;
-            lsq_st[lt]       <= 0;
-            lsq_ardy[lt]     <= p0_r31_rdy;
-            lsq_drdy[lt]     <= 1;
-            lsq_cmt[lt]      <= 0;
-            lsq_base[lt]     <= p0_r31_val;  // r31 = 524288
-            lsq_data[lt]     <= 64'd0;
-            lsq_imm[lt]      <= 64'hFFFFFFFFFFFFFFF8; // -8
-            lsq_ps[lt]       <= p0_r31_phys;
-            lsq_pt[lt]       <= p0_r31_phys;
-            lsq_pd[lt]       <= p0_new;
-            lsq_rob[lt]      <= p0_rob;
-            lsq_isret[lt]    <= 1;
-            lt = lt + 1;
-            lc = lc + 1;
+            // return: bypass OOO pipeline. Set pending flag; redirect fires next cycle.
+            ret_pending <= 1;
+            ret_addr    <= p0_r31_val + 64'hFFFFFFFFFFFFFFF8; // r31 - 8
+            rc = rc - 1;
+            rt = rt - 1;
+            rob_valid[p0_rob] <= 0;
           end else if (d0_fp) begin
             fp_v[fp_free_slot]     <= 1;
             fp_op[fp_free_slot]    <= d0_op;
@@ -1028,15 +1038,15 @@ module tinker_core (
           rt     = rt + 1;
           rc     = rc + 1;
           rob_valid[p1_rob]      <= 1;
-          rob_done[p1_rob]       <= (!d1_wr || d1_hlt || d1_st || d1_ret) ? 1 : 0;
+          rob_done[p1_rob]       <= (!d1_wr || d1_hlt || d1_st) ? 1 : 0;
           rob_arch[p1_rob]       <= d1_rd;
           rob_phys[p1_rob]       <= p1_new;
           rob_old[p1_rob]        <= p1_old;
           rob_has_dest[p1_rob]   <= d1_wr;
-          rob_is_store[p1_rob]   <= d1_st || d1_call;
+          rob_is_store[p1_rob]   <= d1_st;
           rob_is_halt[p1_rob]    <= d1_hlt;
           rob_is_branch[p1_rob]  <= d1_br;
-          rob_is_jump[p1_rob]    <= d1_jmp || d1_call || d1_ret;
+          rob_is_jump[p1_rob]    <= d1_jmp;
           rob_pc[p1_rob]         <= dq_pc1;
           rob_pred_taken[p1_rob] <= 0;
           rob_pred_tgt[p1_rob]   <= dq_pc1 + 64'd4;
@@ -1061,44 +1071,19 @@ module tinker_core (
             lt = lt + 1;
             lc = lc + 1;
           end else if (d1_call) begin
-            rob_has_dest[p1_rob]   <= 0;
-            rob_done[p1_rob]       <= 1;   // ready immediately
-            rob_act_taken[p1_rob]  <= 1;
-            rob_act_tgt[p1_rob]    <= p1_vs; // jump target = rd value
-            lsq_v[lt]       <= 1;
-            lsq_ld[lt]      <= 0;
-            lsq_st[lt]      <= 1;
-            lsq_ardy[lt]    <= p1_r31_rdy;
-            lsq_drdy[lt]    <= 1;
-            lsq_cmt[lt]     <= 0;
-            lsq_base[lt]    <= p1_r31_val;
-            lsq_data[lt]    <= dq_pc1 + 64'd4;
-            lsq_imm[lt]     <= 64'hFFFFFFFFFFFFFFF8;
-            lsq_ps[lt]      <= p1_r31_phys;
-            lsq_pt[lt]      <= p1_r31_phys;
-            lsq_pd[lt]      <= p1_new;
-            lsq_rob[lt]     <= p1_rob;
-            lsq_isret[lt]   <= 0;
-            lt = lt + 1;
-            lc = lc + 1;
+            call_pending <= 1;
+            call_tgt     <= p1_vs;
+            call_addr    <= p1_r31_val + 64'hFFFFFFFFFFFFFFF8;
+            call_wdata   <= dq_pc1 + 64'd4;
+            rc = rc - 1;
+            rt = rt - 1;
+            rob_valid[p1_rob] <= 0;
           end else if (d1_ret) begin
-            rob_done[p1_rob] <= 0;
-            lsq_v[lt]        <= 1;
-            lsq_ld[lt]       <= 1;
-            lsq_st[lt]       <= 0;
-            lsq_ardy[lt]     <= p1_r31_rdy;
-            lsq_drdy[lt]     <= 1;
-            lsq_cmt[lt]      <= 0;
-            lsq_base[lt]     <= p1_r31_val;
-            lsq_data[lt]     <= 64'd0;
-            lsq_imm[lt]      <= 64'hFFFFFFFFFFFFFFF8;
-            lsq_ps[lt]       <= p1_r31_phys;
-            lsq_pt[lt]       <= p1_r31_phys;
-            lsq_pd[lt]       <= p1_new;
-            lsq_rob[lt]      <= p1_rob;
-            lsq_isret[lt]    <= 1;
-            lt = lt + 1;
-            lc = lc + 1;
+            ret_pending <= 1;
+            ret_addr    <= p1_r31_val + 64'hFFFFFFFFFFFFFFF8;
+            rc = rc - 1;
+            rt = rt - 1;
+            rob_valid[p1_rob] <= 0;
           end else if (d1_fp) begin
             begin : fp_slot1
               reg [2:0] fslot;
