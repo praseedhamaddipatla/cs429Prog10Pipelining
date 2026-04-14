@@ -7,7 +7,7 @@
   `define MEM_SIZE (512 * 1024)
 `endif
 
-module mem_module #(
+module memory #(
     parameter MEM_SIZE = `MEM_SIZE
 ) (
     input         clk,
