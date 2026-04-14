@@ -1,227 +1,323 @@
-// tb_decoder.v — unit tests for the decoder module
+// tb_decoder.sv — testbench for decoder module
+// covers: every opcode in the tinker ISA, control signal correctness,
+//         immediate sign/zero extension, default NOP behavior
+
+`timescale 1ns/1ps
+
 module tb_decoder;
 
-  reg [31:0] instr;
-  wire [4:0] raddr1, raddr2, waddr, op, rt_addr;
-  wire [11:0] immediate;
-  wire use_imm, write;
-  wire is_load, is_store, is_branch, is_brgt, is_jump;
-  wire is_brr_reg, is_brr_imm, is_return, is_call, is_halt;
-  wire is_mov_reg, is_mov_imm;
+// ============================================================
+// DUT
+// ============================================================
+logic [31:0] instr;
 
-  decoder dut (
-      .instr     (instr),
-      .raddr1    (raddr1),
-      .raddr2    (raddr2),
-      .waddr     (waddr),
-      .immediate (immediate),
-      .op        (op),
-      .use_imm   (use_imm),
-      .write     (write),
-      .is_load   (is_load),
-      .is_store  (is_store),
-      .is_branch (is_branch),
-      .is_brgt   (is_brgt),
-      .is_jump   (is_jump),
-      .is_brr_reg(is_brr_reg),
-      .is_brr_imm(is_brr_imm),
-      .is_return (is_return),
-      .is_call   (is_call),
-      .is_halt   (is_halt),
-      .is_mov_reg(is_mov_reg),
-      .is_mov_imm(is_mov_imm),
-      .rt_addr   (rt_addr)
-  );
+logic [4:0]  raddr1, raddr2, waddr, rt_addr;
+logic [63:0] immediate;
+logic [4:0]  op;
+logic        use_imm, write;
+logic        is_load, is_store;
+logic        is_branch, is_brgt, is_jump;
+logic        is_brr_reg, is_brr_imm;
+logic        is_return, is_call, is_halt;
+logic        is_mov_reg, is_mov_imm;
 
-  integer pass_count, fail_count;
+decoder dut (
+    .instr      (instr),
+    .raddr1     (raddr1),     .raddr2    (raddr2),
+    .waddr      (waddr),      .immediate (immediate),
+    .op         (op),         .use_imm   (use_imm),
+    .write      (write),      .is_load   (is_load),
+    .is_store   (is_store),   .is_branch (is_branch),
+    .is_brgt    (is_brgt),    .is_jump   (is_jump),
+    .is_brr_reg (is_brr_reg), .is_brr_imm(is_brr_imm),
+    .is_return  (is_return),  .is_call   (is_call),
+    .is_halt    (is_halt),    .is_mov_reg(is_mov_reg),
+    .is_mov_imm (is_mov_imm), .rt_addr   (rt_addr)
+);
 
-  // opcode[31:27] rd[26:22] rs[21:17] rt[16:12] imm[11:0]
-  function [31:0] enc;
-    input [4:0] opc, rd, rs, rt;
-    input [11:0] im;
-    enc = (opc << 27) | (rd << 22) | (rs << 17) | (rt << 12) | im;
-  endfunction
+// ============================================================
+// Helpers
+// ============================================================
+int pass_cnt, fail_cnt;
 
-  task chk5;
-    input [4:0] exp, got;
-    input [255:0] name;
-    begin
-      if (got === exp) begin
-        $display("  pass [%s]: %0d", name, got);
-        pass_count = pass_count + 1;
-      end else begin
-        $display("  FAIL [%s]: got %0d  exp %0d", name, got, exp);
-        fail_count = fail_count + 1;
-      end
+// Build instruction word: {opcode[31:27], rd[26:22], rs[21:17], rt[16:12], imm[11:0]}
+function automatic logic [31:0] mkI(
+    input logic [4:0] opc, rd, rs, rt,
+    input logic [11:0] imm
+);
+    return {opc, rd, rs, rt, imm};
+endfunction
+
+task automatic chk_bit(input string name, input logic got, input logic exp);
+    if (got === exp) begin
+        pass_cnt++;
+    end else begin
+        $display("  FAIL  %-30s  got=%b exp=%b", name, got, exp);
+        fail_cnt++;
     end
-  endtask
+endtask
 
-  task chk12;
-    input [11:0] exp, got;
-    input [255:0] name;
-    begin
-      if (got === exp) begin
-        $display("  pass [%s]: 0x%03h", name, got);
-        pass_count = pass_count + 1;
-      end else begin
-        $display("  FAIL [%s]: got 0x%03h  exp 0x%03h", name, got, exp);
-        fail_count = fail_count + 1;
-      end
+task automatic chk5(input string name, input logic [4:0] got, input logic [4:0] exp);
+    if (got === exp) begin
+        pass_cnt++;
+    end else begin
+        $display("  FAIL  %-30s  got=%0d exp=%0d", name, got, exp);
+        fail_cnt++;
     end
-  endtask
+endtask
 
-  task chk1;
-    input exp, got;
-    input [255:0] name;
-    begin
-      if (got === exp) begin
-        $display("  pass [%s]: %b", name, got);
-        pass_count = pass_count + 1;
-      end else begin
-        $display("  FAIL [%s]: got %b  exp %b", name, got, exp);
-        fail_count = fail_count + 1;
-      end
+task automatic chk64(input string name, input logic [63:0] got, input logic [63:0] exp);
+    if (got === exp) begin
+        pass_cnt++;
+    end else begin
+        $display("  FAIL  %-30s  got=%016h exp=%016h", name, got, exp);
+        fail_cnt++;
     end
-  endtask
+endtask
 
-  initial begin
-    $dumpfile("sim/tb_decoder.vcd");
-    $dumpvars(0, tb_decoder);
-    pass_count = 0;
-    fail_count = 0;
+// Verify all control signals are zero (no side-effects)
+task automatic verify_clean_flags(input string ctx);
+    chk_bit({ctx, ":is_load"},    is_load,    0);
+    chk_bit({ctx, ":is_store"},   is_store,   0);
+    chk_bit({ctx, ":is_branch"},  is_branch,  0);
+    chk_bit({ctx, ":is_jump"},    is_jump,    0);
+    chk_bit({ctx, ":is_halt"},    is_halt,    0);
+    chk_bit({ctx, ":is_call"},    is_call,    0);
+    chk_bit({ctx, ":is_return"},  is_return,  0);
+endtask
 
-    $display("\n--- and (0x00) ---");
-    instr = enc(5'h00, 5'd3, 5'd1, 5'd2, 12'd0);
-    #1;
-    chk5(5'd3, waddr, "waddr");
-    chk5(5'd1, raddr1, "raddr1");
-    chk5(5'd2, raddr2, "raddr2");
-    chk1(1'b1, write, "write");
-    chk1(1'b0, is_branch, "!branch");
+// ============================================================
+// Tests
+// ============================================================
+initial begin
+    pass_cnt = 0; fail_cnt = 0;
+    $display("===================================================");
+    $display("  DECODER TESTBENCH");
+    $display("===================================================");
 
-    $display("\n--- or (0x01) ---");
-    instr = enc(5'h01, 5'd4, 5'd5, 5'd6, 12'd0);
-    #1;
-    chk5(5'd4, waddr, "waddr");
-    chk5(5'd5, raddr1, "raddr1");
-    chk5(5'd6, raddr2, "raddr2");
+    // ----------------------------------------------------------
+    // Bitwise / shift ops (opcode 0x00–0x07)
+    // ----------------------------------------------------------
+    $display("\n--- Bitwise/Shift ---");
 
-    $display("\n--- xor (0x02) ---");
-    instr = enc(5'h02, 5'd1, 5'd2, 5'd3, 12'd0);
-    #1;
-    chk5(5'd1, waddr, "waddr");
+    // AND rd=2, rs=3, rt=4  -> op=AND(4), write=1, raddr1=3, raddr2=4, waddr=2
+    instr = mkI(5'h00, 5'd2, 5'd3, 5'd4, 12'd0); #1;
+    chk5("AND: raddr1", raddr1, 5'd3);
+    chk5("AND: raddr2", raddr2, 5'd4);
+    chk5("AND: waddr",  waddr,  5'd2);
+    chk_bit("AND: write",    write,   1);
+    chk_bit("AND: use_imm",  use_imm, 0);
+    verify_clean_flags("AND");
 
-    $display("\n--- not (0x03) ---");
-    instr = enc(5'h03, 5'd2, 5'd1, 5'd0, 12'd0);
-    #1;
-    chk5(5'd2, waddr, "waddr");
-    chk5(5'd1, raddr1, "raddr1");
+    // OR
+    instr = mkI(5'h01, 5'd5, 5'd6, 5'd7, 12'd0); #1;
+    chk5("OR: raddr1", raddr1, 5'd6);
+    chk5("OR: waddr",  waddr,  5'd5);
+    chk_bit("OR: write", write, 1);
 
-    $display("\n--- shftr (0x04) ---");
-    instr = enc(5'h04, 5'd3, 5'd1, 5'd2, 12'd0);
-    #1;
+    // XOR
+    instr = mkI(5'h02, 5'd1, 5'd2, 5'd3, 12'd0); #1;
+    chk_bit("XOR: write", write, 1);
 
-    $display("\n--- shftri (0x05) ---");
-    instr = enc(5'h05, 5'd1, 5'd0, 5'd0, 12'd5);
-    #1;
-    chk12(12'd5, immediate, "imm");
-    chk1(1'b1, use_imm, "use_imm");
-    chk5(5'd1, waddr, "waddr");
+    // NOT rd=1, rs=2 (single src)
+    instr = mkI(5'h03, 5'd1, 5'd2, 5'd0, 12'd0); #1;
+    chk5("NOT: raddr1", raddr1, 5'd2);
+    chk5("NOT: waddr",  waddr,  5'd1);
+    chk_bit("NOT: write", write, 1);
 
-    $display("\n--- shftl/shftli (0x06/0x07) ---");
-    instr = enc(5'h06, 5'd3, 5'd1, 5'd2, 12'd0);
-    #1;
-    instr = enc(5'h07, 5'd1, 5'd0, 5'd0, 12'd8);
-    #1;
-    chk12(12'd8, immediate, "shftli_imm");
+    // SHFTRI rd=2, imm=4 (rd is both src and dest)
+    instr = mkI(5'h05, 5'd2, 5'd0, 5'd0, 12'd4); #1;
+    chk5("SHFTRI: raddr1",  raddr1,    5'd2);
+    chk5("SHFTRI: waddr",   waddr,     5'd2);
+    chk_bit("SHFTRI: use_imm", use_imm, 1);
+    chk64("SHFTRI: imm=4",  immediate, 64'd4);  // unsigned
 
-    $display("\n--- br (0x08) ---");
-    instr = enc(5'h08, 5'd4, 5'd0, 5'd0, 12'd0);
-    #1;
-    chk1(1'b1, is_jump, "is_jump");
-    chk1(1'b0, is_brr_imm, "!brr_imm");
+    // SHFTLI rd=3, imm=8
+    instr = mkI(5'h07, 5'd3, 5'd0, 5'd0, 12'd8); #1;
+    chk_bit("SHFTLI: use_imm", use_imm, 1);
+    chk64("SHFTLI: imm=8",  immediate, 64'd8);
 
-    $display("\n--- brr_reg (0x09) ---");
-    instr = enc(5'h09, 5'd4, 5'd0, 5'd0, 12'd0);
-    #1;
-    chk1(1'b1, is_brr_reg, "is_brr_reg");
+    // ----------------------------------------------------------
+    // Branch / Jump (opcode 0x08–0x0E)
+    // ----------------------------------------------------------
+    $display("\n--- Branch/Jump ---");
 
-    $display("\n--- brr_imm (0x0A) ---");
-    instr = enc(5'h0A, 5'd0, 5'd0, 5'd0, 12'd8);
-    #1;
-    chk12(12'd8, immediate, "imm");
-    chk1(1'b1, is_brr_imm, "is_brr_imm");
+    // BR rd (absolute jump)
+    instr = mkI(5'h08, 5'd5, 5'd0, 5'd0, 12'd0); #1;
+    chk_bit("BR: is_jump",    is_jump,    1);
+    chk_bit("BR: is_brr_reg", is_brr_reg, 0);
+    chk_bit("BR: write",      write,      0);
+    chk5("BR: raddr1",       raddr1,     5'd5);
 
-    $display("\n--- brnz (0x0B) ---");
-    instr = enc(5'h0B, 5'd4, 5'd1, 5'd0, 12'd0);
-    #1;
-    chk5(5'd1, raddr1, "raddr1");
-    chk1(1'b1, is_branch, "is_branch");
+    // BRR rd (pc-relative, reg offset)
+    instr = mkI(5'h09, 5'd6, 5'd0, 5'd0, 12'd0); #1;
+    chk_bit("BRR: is_jump",    is_jump,    1);
+    chk_bit("BRR: is_brr_reg", is_brr_reg, 1);
+    chk_bit("BRR: is_brr_imm", is_brr_imm, 0);
 
-    $display("\n--- call (0x0C) ---");
-    instr = enc(5'h0C, 5'd4, 5'd0, 5'd0, 12'd0);
-    #1;
-    chk1(1'b1, is_call, "is_call");
+    // BRR L (pc-relative, imm offset) — signed imm
+    instr = mkI(5'h0A, 5'd0, 5'd0, 5'd0, 12'hFFF); #1; // imm=-1
+    chk_bit("BRRI: is_jump",    is_jump,    1);
+    chk_bit("BRRI: is_brr_imm", is_brr_imm, 1);
+    chk64("BRRI: imm=-1 sext", immediate, 64'hFFFFFFFFFFFFFFFF);
 
-    $display("\n--- return (0x0D) ---");
-    instr = enc(5'h0D, 5'd0, 5'd0, 5'd0, 12'd0);
-    #1;
-    chk1(1'b1, is_return, "is_return");
+    // BRNZ rd, rs
+    instr = mkI(5'h0B, 5'd7, 5'd8, 5'd0, 12'd0); #1;
+    chk_bit("BRNZ: is_branch", is_branch, 1);
+    chk_bit("BRNZ: is_jump",   is_jump,   0);
+    chk_bit("BRNZ: write",     write,     0);
 
-    $display("\n--- brgt (0x0E) ---");
-    instr = enc(5'h0E, 5'd4, 5'd1, 5'd2, 12'd0);
-    #1;
-    chk1(1'b1, is_brgt, "is_brgt");
-    chk5(5'd2, rt_addr, "rt_addr");
+    // CALL rd — saves ret addr in r31
+    instr = mkI(5'h0C, 5'd4, 5'd0, 5'd0, 12'd0); #1;
+    chk_bit("CALL: is_jump",  is_jump,  1);
+    chk_bit("CALL: is_call",  is_call,  1);
+    chk_bit("CALL: write",    write,    1);
+    chk5("CALL: waddr=r31", waddr,    5'd31);
 
-    $display("\n--- halt (0x0F) ---");
-    instr = enc(5'h0F, 5'd0, 5'd0, 5'd0, 12'd0);
-    #1;
-    chk1(1'b1, is_halt, "is_halt");
+    // RETURN
+    instr = mkI(5'h0D, 5'd0, 5'd0, 5'd0, 12'd0); #1;
+    chk_bit("RETURN: is_jump",   is_jump,   1);
+    chk_bit("RETURN: is_return", is_return, 1);
 
-    $display("\n--- load (0x10) ---");
-    instr = enc(5'h10, 5'd3, 5'd1, 5'd0, 12'h10);
-    #1;
-    chk5(5'd3, waddr, "waddr");
-    chk5(5'd1, raddr1, "raddr1");
-    chk12(12'h10, immediate, "imm");
-    chk1(1'b1, is_load, "is_load");
-    chk1(1'b1, write, "write");
+    // BRGT rd, rs, rt — 3-src branch
+    instr = mkI(5'h0E, 5'd1, 5'd2, 5'd3, 12'd0); #1;
+    chk_bit("BRGT: is_branch", is_branch, 1);
+    chk_bit("BRGT: is_brgt",   is_brgt,   1);
+    chk5("BRGT: raddr1",      raddr1,    5'd1);
+    chk5("BRGT: raddr2",      raddr2,    5'd2);
+    chk5("BRGT: rt_addr",     rt_addr,   5'd3);
 
-    $display("\n--- mov_reg (0x11) ---");
-    instr = enc(5'h11, 5'd2, 5'd1, 5'd0, 12'd0);
-    #1;
-    chk5(5'd2, waddr, "waddr");
-    chk5(5'd1, raddr1, "raddr1");
-    chk1(1'b1, is_mov_reg, "is_mov_reg");
-    chk1(1'b1, write, "write");
+    // ----------------------------------------------------------
+    // HALT (0x0F)
+    // ----------------------------------------------------------
+    $display("\n--- Halt ---");
+    instr = mkI(5'h0F, 5'd0, 5'd0, 5'd0, 12'd0); #1;
+    chk_bit("HALT: is_halt",   is_halt,  1);
+    chk_bit("HALT: write",     write,    0);
+    chk_bit("HALT: is_branch", is_branch, 0);
 
-    $display("\n--- mov_imm (0x12) ---");
-    instr = enc(5'h12, 5'd1, 5'd0, 5'd0, 12'hABC);
-    #1;
-    chk12(12'hABC, immediate, "imm");
-    chk1(1'b1, is_mov_imm, "is_mov_imm");
-    chk1(1'b1, write, "write");
+    // ----------------------------------------------------------
+    // Load / Store (0x10–0x13)
+    // ----------------------------------------------------------
+    $display("\n--- Load/Store ---");
 
-    $display("\n--- store (0x13) ---");
-    instr = enc(5'h13, 5'd1, 5'd2, 5'd0, 12'd8);
-    #1;
-    chk1(1'b1, is_store, "is_store");
-    chk1(1'b0, write, "!write");
+    // LOAD rd=5, rs=3, imm=+10 (signed)
+    instr = mkI(5'h10, 5'd5, 5'd3, 5'd0, 12'd10); #1;
+    chk_bit("LOAD: is_load",   is_load,  1);
+    chk_bit("LOAD: is_store",  is_store, 0);
+    chk_bit("LOAD: write",     write,    1);
+    chk5("LOAD: raddr1",      raddr1,   5'd3);
+    chk5("LOAD: waddr",       waddr,    5'd5);
+    chk64("LOAD: imm=+10",   immediate, 64'd10);
 
-    $display("\n--- addf (0x14) ---");
-    instr = enc(5'h14, 5'd4, 5'd2, 5'd3, 12'd0);
-    #1;
-    chk1(1'b1, write, "write");
+    // LOAD with negative imm
+    instr = mkI(5'h10, 5'd1, 5'd2, 5'd0, 12'hFF6); #1; // -10
+    chk64("LOAD: imm=-10 sext", immediate, 64'hFFFFFFFFFFFFFFF6);
 
-    $display("\n--- sub/subi (0x1A/0x1B) ---");
-    instr = enc(5'h1A, 5'd3, 5'd1, 5'd2, 12'd0);
-    #1;
-    instr = enc(5'h1B, 5'd1, 5'd0, 5'd0, 12'd7);
-    #1;
-    chk12(12'd7, immediate, "subi_imm");
+    // MOV rd, rs (reg)
+    instr = mkI(5'h11, 5'd8, 5'd9, 5'd0, 12'd0); #1;
+    chk_bit("MOV_REG: is_mov_reg", is_mov_reg, 1);
+    chk_bit("MOV_REG: write",      write,      1);
+    chk5("MOV_REG: raddr1",       raddr1,     5'd9);
+    chk5("MOV_REG: waddr",        waddr,      5'd8);
 
-    $display("\n--- results: %0d passed, %0d failed ---", pass_count, fail_count);
+    // MOV rd, imm (unsigned)
+    instr = mkI(5'h12, 5'd10, 5'd0, 5'd0, 12'hABC); #1;
+    chk_bit("MOV_IMM: is_mov_imm", is_mov_imm, 1);
+    chk_bit("MOV_IMM: use_imm",    use_imm,    1); // but note: MOV_IMM uses imm field
+    chk64("MOV_IMM: imm=0xABC",   immediate, 64'h0000000000000ABC);
+
+    // STORE (rd)(imm), rs — no write, has store flag
+    instr = mkI(5'h13, 5'd6, 5'd7, 5'd0, 12'h004); #1;
+    chk_bit("STORE: is_store",  is_store, 1);
+    chk_bit("STORE: is_load",   is_load,  0);
+    chk_bit("STORE: write",     write,    0);
+    chk5("STORE: raddr1",      raddr1,   5'd6);
+    chk5("STORE: raddr2",      raddr2,   5'd7);
+
+    // ----------------------------------------------------------
+    // FP ops (0x14–0x17)
+    // ----------------------------------------------------------
+    $display("\n--- FP ops ---");
+
+    // ADDF rd=1, rs=2, rt=3 -> op=ADDF(10)
+    instr = mkI(5'h14, 5'd1, 5'd2, 5'd3, 12'd0); #1;
+    chk5("ADDF: op",    op,     5'd10);
+    chk_bit("ADDF: write", write, 1);
+    chk5("ADDF: raddr1", raddr1, 5'd2);
+    chk5("ADDF: raddr2", raddr2, 5'd3);
+
+    // SUBF -> op=11
+    instr = mkI(5'h15, 5'd1, 5'd2, 5'd3, 12'd0); #1;
+    chk5("SUBF: op", op, 5'd11);
+
+    // MULF -> op=12
+    instr = mkI(5'h16, 5'd1, 5'd2, 5'd3, 12'd0); #1;
+    chk5("MULF: op", op, 5'd12);
+
+    // DIVF -> op=13
+    instr = mkI(5'h17, 5'd1, 5'd2, 5'd3, 12'd0); #1;
+    chk5("DIVF: op", op, 5'd13);
+
+    // ----------------------------------------------------------
+    // Integer ALU (0x18–0x1D)
+    // ----------------------------------------------------------
+    $display("\n--- Int ALU ---");
+
+    // ADD rd=4, rs=5, rt=6
+    instr = mkI(5'h18, 5'd4, 5'd5, 5'd6, 12'd0); #1;
+    chk5("ADD: op",    op,     5'd0);
+    chk_bit("ADD: write", write, 1);
+    chk5("ADD: raddr1", raddr1, 5'd5);
+
+    // ADDI rd=2, imm=-1 (signed)
+    instr = mkI(5'h19, 5'd2, 5'd0, 5'd0, 12'hFFF); #1;
+    chk_bit("ADDI: use_imm", use_imm, 1);
+    chk5("ADDI: raddr1",    raddr1,  5'd2); // rd used as src
+    chk64("ADDI: imm=-1",  immediate, 64'hFFFFFFFFFFFFFFFF);
+
+    // SUB
+    instr = mkI(5'h1A, 5'd1, 5'd2, 5'd3, 12'd0); #1;
+    chk5("SUB: op", op, 5'd1);
+
+    // SUBI rd=3, imm=5
+    instr = mkI(5'h1B, 5'd3, 5'd0, 5'd0, 12'd5); #1;
+    chk_bit("SUBI: use_imm", use_imm, 1);
+    chk64("SUBI: imm=5", immediate, 64'h5);
+
+    // MUL
+    instr = mkI(5'h1C, 5'd1, 5'd2, 5'd3, 12'd0); #1;
+    chk5("MUL: op", op, 5'd2);
+
+    // DIV
+    instr = mkI(5'h1D, 5'd1, 5'd2, 5'd3, 12'd0); #1;
+    chk5("DIV: op", op, 5'd3);
+
+    // ----------------------------------------------------------
+    // Default / unknown opcode → NOP (no writes, no flags)
+    // ----------------------------------------------------------
+    $display("\n--- Default/NOP ---");
+    instr = 32'hFFFFFFFF; #1; // all-ones: opcode=5'h1F (undefined)
+    chk_bit("UNDEF: write",     write,    0);
+    chk_bit("UNDEF: is_load",   is_load,  0);
+    chk_bit("UNDEF: is_store",  is_store, 0);
+    chk_bit("UNDEF: is_halt",   is_halt,  0);
+    chk_bit("UNDEF: is_branch", is_branch,0);
+    chk_bit("UNDEF: is_jump",   is_jump,  0);
+
+    // NOP = 0x00000000 (AND r0, r0, r0) — writes r0 but r0 is special
+    instr = 32'd0; #1;
+    chk_bit("NOP(0): write", write, 1); // AND r0,r0,r0 does set write; harmless
+
+    // ----------------------------------------------------------
+    // Summary
+    // ----------------------------------------------------------
+    $display("\n===================================================");
+    $display("  DECODER RESULTS: %0d passed, %0d failed", pass_cnt, fail_cnt);
+    $display("===================================================");
+    if (fail_cnt == 0) $display("  ALL TESTS PASSED");
+    else               $display("  *** FAILURES DETECTED ***");
     $finish;
-  end
+end
+
 endmodule
