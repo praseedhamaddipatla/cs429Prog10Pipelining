@@ -403,8 +403,9 @@ module tinker_core (
   //   call:    pc+4 (return address goes into r31)
   //   others:  ALU output
   assign c0pd  = alu_pd_p1;
-  assign c0val = alu_imovr_p1 ? alu_vs_p1                      // mov rd, rs
-               : alu_ical_p1  ? (alu_pc_p1 + 64'd4)            // call: r31 = pc+4
+  assign c0val = alu_imovr_p1 ? alu_vs_p1                               // mov rd, rs
+               : alu_ical_p1  ? (alu_pc_p1 + 64'd4)                     // call: pc+4
+               : alu_imovi_p1 ? ((alu_vs_p1 & ~64'hFFF) | alu_b_p1)    // mov rd, L: mask-OR
                : alu_res;
 
   // Actual branch/jump outcome (used to update ROB)
@@ -916,35 +917,12 @@ module tinker_core (
             lc = lc + 1;
           end else if (d0_call) begin
             // call: jump to rd, push pc+4 to mem[r31-8], NO register writeback.
-            // The original decoder sets write=1 and waddr=r31 but the reference
-            // multicycle guards reg_we with !is_call_r — so we force has_dest=0.
-            // rob_done=0: wait for ALU so we get act_taken/act_tgt for the jump.
-            rob_has_dest[p0_rob]   <= 0;   // override: call writes no register
-            rob_done[p0_rob]       <= 0;   // wait for ALU (ical) to set act_tgt
-            rs_v[rs_free_slot]      <= 1;
-            rs_op[rs_free_slot]     <= 5'd0;   // ADD placeholder
-            rs_ps[rs_free_slot]     <= p0_ps;  // rd = jump target
-            rs_pt[rs_free_slot]     <= p0_ps;
-            rs_psrdy[rs_free_slot]  <= p0_psrdy;
-            rs_ptrdy[rs_free_slot]  <= 1;
-            rs_vs[rs_free_slot]     <= p0_vs;  // rd value (jump target)
-            rs_vt[rs_free_slot]     <= 64'd0;
-            rs_imm[rs_free_slot]    <= 64'd0;
-            rs_uimm[rs_free_slot]   <= 1;
-            rs_rob[rs_free_slot]    <= p0_rob;
-            rs_pc[rs_free_slot]     <= dq_pc0;
-            rs_ibr[rs_free_slot]    <= 0;
-            rs_ibgt[rs_free_slot]   <= 0;
-            rs_ijmp[rs_free_slot]   <= 1;
-            rs_ibrreg[rs_free_slot] <= 0;
-            rs_ibrimm[rs_free_slot] <= 0;
-            rs_imovr[rs_free_slot]  <= 0;
-            rs_imovi[rs_free_slot]  <= 0;
-            rs_ical[rs_free_slot]   <= 1;
-            rs_iret[rs_free_slot]   <= 0;
-            rs_ptaken[rs_free_slot] <= 0;
-            rs_ptgt[rs_free_slot]   <= dq_pc0 + 64'd4;
-            rsc = rsc + 1;
+            // Resolve the jump at dispatch time — target is p0_vs (rd value).
+            // No RS/ALU entry: avoids prf[r31] corruption from the ALU result path.
+            rob_has_dest[p0_rob]   <= 0;   // no register writeback
+            rob_done[p0_rob]       <= 1;   // ready immediately (no ALU needed)
+            rob_act_taken[p0_rob]  <= 1;   // call always jumps
+            rob_act_tgt[p0_rob]    <= p0_vs; // jump target = rd value
             // LSQ store: push pc+4 to mem[r31-8]
             lsq_v[lt]       <= 1;
             lsq_ld[lt]      <= 0;
@@ -964,22 +942,23 @@ module tinker_core (
             lc = lc + 1;
           end else if (d0_ret) begin
             // return: pc = mem[r31-8]. No dest register.
-            // Override rob_done=0: wait for load result before commit.
+            // Original decoder sets raddr1=0 (default), so p0_ps/p0_vs = r0 = 0.
+            // Always use p0_r31_* directly for the stack base.
             rob_done[p0_rob] <= 0;
             lsq_v[lt]        <= 1;
             lsq_ld[lt]       <= 1;
             lsq_st[lt]       <= 0;
-            lsq_ardy[lt]     <= p0_psrdy;  // raddr1 = r31
+            lsq_ardy[lt]     <= p0_r31_rdy;
             lsq_drdy[lt]     <= 1;
             lsq_cmt[lt]      <= 0;
-            lsq_base[lt]     <= p0_vs;     // r31 value
+            lsq_base[lt]     <= p0_r31_val;  // r31 = 524288
             lsq_data[lt]     <= 64'd0;
             lsq_imm[lt]      <= 64'hFFFFFFFFFFFFFFF8; // -8
-            lsq_ps[lt]       <= p0_ps;
-            lsq_pt[lt]       <= p0_ps;
+            lsq_ps[lt]       <= p0_r31_phys;
+            lsq_pt[lt]       <= p0_r31_phys;
             lsq_pd[lt]       <= p0_new;
             lsq_rob[lt]      <= p0_rob;
-            lsq_isret[lt]    <= 1;   // loaded value becomes PC
+            lsq_isret[lt]    <= 1;
             lt = lt + 1;
             lc = lc + 1;
           end else if (d0_fp) begin
@@ -1083,36 +1062,9 @@ module tinker_core (
             lc = lc + 1;
           end else if (d1_call) begin
             rob_has_dest[p1_rob]   <= 0;
-            rob_done[p1_rob]       <= 0;
-            begin : rs_slot1_call
-              reg [3:0] rslot;
-              rslot = 0;
-              for (j = RS_INT-1; j >= 0; j = j-1) if (!rs_v[j]) rslot = j[3:0];
-              rs_v[rslot]      <= 1;
-              rs_op[rslot]     <= 5'd0;
-              rs_ps[rslot]     <= p1_ps;
-              rs_pt[rslot]     <= p1_ps;
-              rs_psrdy[rslot]  <= p1_psrdy;
-              rs_ptrdy[rslot]  <= 1;
-              rs_vs[rslot]     <= p1_vs;
-              rs_vt[rslot]     <= 64'd0;
-              rs_imm[rslot]    <= 64'd0;
-              rs_uimm[rslot]   <= 1;
-              rs_rob[rslot]    <= p1_rob;
-              rs_pc[rslot]     <= dq_pc1;
-              rs_ibr[rslot]    <= 0;
-              rs_ibgt[rslot]   <= 0;
-              rs_ijmp[rslot]   <= 1;
-              rs_ibrreg[rslot] <= 0;
-              rs_ibrimm[rslot] <= 0;
-              rs_imovr[rslot]  <= 0;
-              rs_imovi[rslot]  <= 0;
-              rs_ical[rslot]   <= 1;
-              rs_iret[rslot]   <= 0;
-              rs_ptaken[rslot] <= 0;
-              rs_ptgt[rslot]   <= dq_pc1 + 64'd4;
-              rsc = rsc + 1;
-            end
+            rob_done[p1_rob]       <= 1;   // ready immediately
+            rob_act_taken[p1_rob]  <= 1;
+            rob_act_tgt[p1_rob]    <= p1_vs; // jump target = rd value
             lsq_v[lt]       <= 1;
             lsq_ld[lt]      <= 0;
             lsq_st[lt]      <= 1;
@@ -1134,14 +1086,14 @@ module tinker_core (
             lsq_v[lt]        <= 1;
             lsq_ld[lt]       <= 1;
             lsq_st[lt]       <= 0;
-            lsq_ardy[lt]     <= p1_psrdy;
+            lsq_ardy[lt]     <= p1_r31_rdy;
             lsq_drdy[lt]     <= 1;
             lsq_cmt[lt]      <= 0;
-            lsq_base[lt]     <= p1_vs;
+            lsq_base[lt]     <= p1_r31_val;
             lsq_data[lt]     <= 64'd0;
             lsq_imm[lt]      <= 64'hFFFFFFFFFFFFFFF8;
-            lsq_ps[lt]       <= p1_ps;
-            lsq_pt[lt]       <= p1_ps;
+            lsq_ps[lt]       <= p1_r31_phys;
+            lsq_pt[lt]       <= p1_r31_phys;
             lsq_pd[lt]       <= p1_new;
             lsq_rob[lt]      <= p1_rob;
             lsq_isret[lt]    <= 1;
