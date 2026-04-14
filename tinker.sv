@@ -705,7 +705,7 @@ module tinker_core (
           if (do_flush) begin
             for (i = 0; i < RS_INT;   i = i+1) rs_v[i]      <= 0;
             for (i = 0; i < RS_FP;    i = i+1) fp_v[i]      <= 0;
-            for (i = 0; i < LSQ_SIZE; i = i+1) lsq_v[i]     <= 0;
+            for (i = 0; i < LSQ_SIZE; i = i+1) begin lsq_v[i] <= 0; lsq_isret[i] <= 0; end
             for (i = 0; i < ROB_SIZE; i = i+1)
               if (i[ROB_BITS-1:0] != ch) begin rob_valid[i] <= 0; rob_done[i] <= 0; end
             // Restore RAT and prf from reg_file.registers[] which always holds
@@ -1168,13 +1168,13 @@ module tinker_core (
               rs_pc[rslot]     <= dq_pc1;
               rs_ibr[rslot]    <= d1_br;
               rs_ibgt[rslot]   <= d1_brgt;
-              rs_ijmp[rslot]   <= d1_jmp || d1_call || d1_ret;
+              rs_ijmp[rslot]   <= d1_jmp;
               rs_ibrreg[rslot] <= d1_brrr;
               rs_ibrimm[rslot] <= d1_brri;
               rs_imovr[rslot]  <= d1_mvr;
               rs_imovi[rslot]  <= d1_mvi;
-              rs_ical[rslot]   <= d1_call;
-              rs_iret[rslot]   <= d1_ret;
+              rs_ical[rslot]   <= 0;
+              rs_iret[rslot]   <= 0;
               rs_ptaken[rslot] <= 0;
               rs_ptgt[rslot]   <= dq_pc1 + 64'd4;
               rsc = rsc + 1;
