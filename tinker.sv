@@ -1084,13 +1084,22 @@ module tinker_core (
         fl_cnt   <= fc;
         rob_tail <= rt;
         rob_cnt  <= rc;
-        rs_cnt   <= rsc;
-        fp_cnt   <= fpc;
+        // Single NBA write accounts for both dispatch increments AND issue decrements.
+        // rs_iss_found / fp_iss_found are combinatorial wires evaluated before this block.
+        rs_cnt   <= rsc - (rs_iss_found ? 4'd1 : 4'd0);
+        fp_cnt   <= fpc - (fp_iss_found ? 3'd1 : 3'd0);
         lsq_tail <= lt;
         lsq_cnt  <= lc;
       end // dispatch_blk
 
-      // (D moved after dispatch so issue NBAs win over dispatch's fp_cnt/rs_cnt NBAs)
+      // When dispatch_blk is skipped (call/ret pending) but issue still fires,
+      // the fp_cnt/rs_cnt still need to decrement. Redirect blocks both,
+      // but call/ret pending only blocks dispatch.
+      if ((call_pending || ret_pending) && !redirect_en) begin
+        if (rs_iss_found) rs_cnt <= rs_cnt - 1;
+        if (fp_iss_found) fp_cnt <= fp_cnt - 1;
+      end
+
       // ================================================================
       // D. FU ISSUE
       // ================================================================
@@ -1122,7 +1131,7 @@ module tinker_core (
           alu_ptaken_p <= rs_ptaken[rs_iss_idx];
           alu_ptgt_p   <= rs_ptgt[rs_iss_idx];
           rs_v[rs_iss_idx] <= 0;
-          rs_cnt       <= rs_cnt - 1;
+          // rs_cnt updated below in combined single-NBA write
         end
         if (fp_iss_found) begin
           fpu_en   <= 1;
@@ -1132,7 +1141,7 @@ module tinker_core (
           fpu_rtag <= {1'b0, fp_rob[fp_iss_idx]};
           fpu_pd   <= rob_phys[fp_rob[fp_iss_idx]];
           fp_v[fp_iss_idx] <= 0;
-          fp_cnt   <= fp_cnt - 1;
+          // fp_cnt updated below in combined single-NBA write
         end
       end
 
