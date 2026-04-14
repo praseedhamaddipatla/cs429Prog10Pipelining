@@ -1,17 +1,6 @@
 // tinker.sv — tinker cpu core (ooo, dual-issue)
 // optimizations: forwarding, multi-issue, ooo, pipelined fu, ls queue,
 //   deeper pipeline, branch prediction, register renaming
-//
-// BUG FIXES:
-//  1. prf[0..31] now mirrors reg_file.registers[] every cycle so that
-//     testbench-loaded initial register state is visible to the OOO engine.
-//  2. call: waddr=rd (not r31), also dispatches a stack-store to the LSQ.
-//  3. return: raddr1=r31 in decoder; dispatch to LSQ as a load, loaded
-//     value becomes the jump target (not a register write).
-//  4. ALU side-channel pipeline regs extended to carry all info needed
-//     for branch/jump/call/return resolution.
-//  5. subi immediate now sign-extended (was already in decoder; fixed
-//     pipeline to properly pass the signed immediate through).
 
 `define MEM_SIZE (512 * 1024)
 `define PC_START 64'h2000
@@ -32,8 +21,8 @@ module tinker_core (
   // ---------------------------------------------------------------------------
   // PARAMETERS
   // ---------------------------------------------------------------------------
-  localparam NPHYS    = 64;
-  localparam PHYS_W   = 6;
+  localparam NPHYS   = 64;
+  localparam PHYS_W  = 6;
   localparam ROB_SIZE = 32;
   localparam ROB_BITS = 5;
   localparam RS_INT   = 8;
@@ -43,6 +32,11 @@ module tinker_core (
   // ---------------------------------------------------------------------------
   // PHYSICAL REGISTER FILE + READY BITS
   // ---------------------------------------------------------------------------
+  // NOTE: prf[0..31] are the SAME storage as arch_rf[0..31].
+  //       The testbench loads .state into arch_rf via the reg_file module's
+  //       internal 'registers' array, which we mirror here.  To keep them
+  //       in sync we use a single 64-entry array where indices 0-31 are
+  //       always kept equal to arch_rf[0-31] at commit / reset.
   reg [63:0] prf     [0:NPHYS-1];
   reg        prf_rdy [0:NPHYS-1];
 
@@ -81,6 +75,7 @@ module tinker_core (
 
   reg [ROB_BITS-1:0] rob_head, rob_tail;
   reg [ROB_BITS:0]   rob_cnt;
+
   wire rob_full = (rob_cnt >= ROB_SIZE - 2);
 
   // ---------------------------------------------------------------------------
@@ -105,8 +100,8 @@ module tinker_core (
   reg              rs_ibrimm [0:RS_INT-1];
   reg              rs_imovr  [0:RS_INT-1];
   reg              rs_imovi  [0:RS_INT-1];
-  reg              rs_ical   [0:RS_INT-1];
-  reg              rs_iret   [0:RS_INT-1];
+  reg              rs_ical   [0:RS_INT-1];  // is_call flag
+  reg              rs_iret   [0:RS_INT-1];  // is_return flag
   reg              rs_ptaken [0:RS_INT-1];
   reg [63:0]       rs_ptgt   [0:RS_INT-1];
 
@@ -145,12 +140,11 @@ module tinker_core (
   reg [PHYS_W-1:0] lsq_pt   [0:LSQ_SIZE-1];
   reg [PHYS_W-1:0] lsq_pd   [0:LSQ_SIZE-1];
   reg [ROB_BITS-1:0] lsq_rob[0:LSQ_SIZE-1];
-  // is_ret flag: this LSQ entry's loaded value becomes the PC (return instruction)
-  reg              lsq_isret[0:LSQ_SIZE-1];
+  reg              lsq_isret[0:LSQ_SIZE-1]; // load result becomes PC (return)
 
   reg [3:0] lsq_head, lsq_tail;
   reg [4:0] lsq_cnt;
-  wire lsq_full = (lsq_cnt >= LSQ_SIZE - 2);  // -2 because call uses 2 LSQ slots
+  wire lsq_full = (lsq_cnt >= LSQ_SIZE - 2); // -2: call uses 2 LSQ slots
 
   // ---------------------------------------------------------------------------
   // DECODE QUEUE
@@ -183,7 +177,11 @@ module tinker_core (
   // ---------------------------------------------------------------------------
   wire stall = rob_full || rs_full || fp_full || lsq_full;
   wire d0_en = dq_v0 && !stall;
-  wire d1_en = dq_v1 && !stall && !d0_hlt;
+  // Never dispatch d1 when d0 is a branch/jump/call/return:
+  // the instruction after a control-flow op is on the not-taken path and
+  // must not execute speculatively in this simple predictor-free design.
+  wire d0_ctrl = d0_jmp || d0_br || d0_call || d0_ret;
+  wire d1_en = dq_v1 && !stall && !d0_hlt && !d0_ctrl;
 
   // ---------------------------------------------------------------------------
   // FUNCTIONAL UNIT ISSUE REGISTERS
@@ -194,6 +192,7 @@ module tinker_core (
   reg [5:0]  alu_rtag;
   reg [PHYS_W-1:0] alu_pd;
 
+  // Side-channel info for the cycle the ALU is fed
   reg [63:0] alu_vs_p, alu_pc_p;
   reg        alu_ibr_p, alu_ibgt_p, alu_ijmp_p;
   reg        alu_ibrreg_p, alu_ibrimm_p;
@@ -293,6 +292,8 @@ module tinker_core (
 
   // ---------------------------------------------------------------------------
   // REG_FILE  (instance name "reg_file" required by autograder)
+  // The testbench loads .state values into reg_file.registers[].
+  // We keep arch_rf in sync so prf[0..31] also sees initial state.
   // ---------------------------------------------------------------------------
   reg [63:0] rf_commit_data;
   reg [4:0]  rf_commit_waddr;
@@ -366,27 +367,25 @@ module tinker_core (
   // ---------------------------------------------------------------------------
   // CDB WIRES
   // ---------------------------------------------------------------------------
-  // cdb0: int alu result (1-cycle delay)
+  // cdb0: int alu result (1-cycle delay from issue)
   wire                c0en  = alu_vout;
   wire [PHYS_W-1:0]   c0pd;
   wire [63:0]         c0val;
   wire [ROB_BITS-1:0] c0rob = alu_tout[ROB_BITS-1:0];
 
-  // 1-cycle side-channel pipeline registers
+  // Pipeline delay registers so side-channel info arrives same cycle as vout
   reg [PHYS_W-1:0] alu_pd_p1;
-  reg [63:0]       alu_vs_p1;     // a value fed to ALU (src reg / call target)
-  reg [63:0]       alu_b_p1;      // b value fed to ALU (imm / src-b)
-  reg [63:0]       alu_pc_p1;     // PC of the issuing instruction
+  reg [63:0]       alu_vs_p1;
   reg              alu_imovr_p1, alu_imovi_p1;
   reg              alu_ical_p1,  alu_iret_p1;
   reg              alu_ibr_p1,   alu_ijmp_p1;
   reg              alu_ibrreg_p1, alu_ibrimm_p1;
+  reg [63:0]       alu_pc_p1;
+  reg [63:0]       alu_b_p1;    // b operand (imm for brr_imm)
 
   always @(posedge clk) begin
     alu_pd_p1     <= alu_pd;
-    alu_vs_p1     <= alu_a;
-    alu_b_p1      <= alu_b;
-    alu_pc_p1     <= alu_pc_p;
+    alu_vs_p1     <= alu_a;       // src-a value (used for mov_reg, br abs, call)
     alu_imovr_p1  <= alu_imovr_p;
     alu_imovi_p1  <= alu_imovi_p;
     alu_ical_p1   <= alu_ical_p;
@@ -395,42 +394,43 @@ module tinker_core (
     alu_ijmp_p1   <= alu_ijmp_p;
     alu_ibrreg_p1 <= alu_ibrreg_p;
     alu_ibrimm_p1 <= alu_ibrimm_p;
+    alu_pc_p1     <= alu_pc_p;
+    alu_b_p1      <= alu_b;       // immediate / reg-b value
   end
 
-  // CDB0 result value:
-  //   mov_reg → forward src unchanged
-  //   call    → pc+4 (return address into link register = rd)
-  //   others  → ALU computed result
+  // Result value on cdb0:
+  //   mov_reg: forward src-a unchanged
+  //   call:    pc+4 (return address goes into r31)
+  //   others:  ALU output
   assign c0pd  = alu_pd_p1;
-  assign c0val = alu_imovr_p1 ? alu_vs_p1
-               : alu_ical_p1  ? (alu_pc_p1 + 64'd4)
+  assign c0val = alu_imovr_p1 ? alu_vs_p1                      // mov rd, rs
+               : alu_ical_p1  ? (alu_pc_p1 + 64'd4)            // call: r31 = pc+4
                : alu_res;
 
-  // Actual branch/jump outcome
-  wire alu_act_taken_w =
-      alu_ibr_p1  ? alu_res[0]   // brnz/brgt: result = 0 or 1
-    : alu_ijmp_p1 ? 1'b1         // unconditional jump always taken
-    : 1'b0;
+  // Actual branch/jump outcome (used to update ROB)
+  wire alu_act_taken_w = alu_ibr_p1  ? alu_res[0]   // brnz/brgt: ALU computed flag
+                        : alu_ijmp_p1 ? 1'b1          // unconditional jump
+                        : 1'b0;
 
-  // Actual jump target:
-  //   brr_imm : pc + imm (b holds imm)
-  //   brr_reg : pc + rs  (a holds rs)
-  //   call    : original rd value (a holds rd; after writing pc+4 the jump uses old rd)
-  //   return  : loaded from memory — NOT known here; handled separately via LSQ
-  //   br abs  : rs value (a holds rs)
+  // Target computation:
+  //   brr_reg : pc + rs_value
+  //   brr_imm : pc + imm
+  //   call    : rs_value (absolute)
+  //   return  : r31 value (absolute)
+  //   br abs  : rs_value (absolute)
   wire [63:0] alu_act_tgt_w =
-      alu_ibrimm_p1 ? (alu_pc_p1 + alu_b_p1)
-    : alu_ibrreg_p1 ? (alu_pc_p1 + alu_vs_p1)
-    : alu_vs_p1;  // br / call — absolute address in src reg
+      alu_ibrimm_p1 ? (alu_pc_p1 + alu_b_p1)   // brr L  — pc-relative imm
+    : alu_ibrreg_p1 ? (alu_pc_p1 + alu_vs_p1)  // brr rd — pc-relative reg
+    : alu_vs_p1;                                 // br/call/return — absolute
 
   // cdb1: fp result or load result
-  wire [PHYS_W-1:0] fp_pd = fp_pd_p[2];
+  wire [PHYS_W-1:0] fp_pd   = fp_pd_p[2];
 
   reg              ld_done;
   reg [PHYS_W-1:0] ld_pd;
   reg [63:0]       ld_val;
   reg [ROB_BITS-1:0] ld_rtag;
-  reg              ld_isret;       // this load is a "return" — result becomes PC redirect
+  reg              ld_isret; // load is a return — result becomes PC
 
   wire                c1en  = ld_done || fpu_vout;
   wire [PHYS_W-1:0]   c1pd  = ld_done ? ld_pd  : fp_pd;
@@ -524,7 +524,6 @@ module tinker_core (
       alu_en        <= 0;
       fpu_en        <= 0;
       ld_done       <= 0;
-      ld_isret      <= 0;
       rob_head      <= 0;
       rob_tail      <= 0;
       rob_cnt       <= 0;
@@ -538,6 +537,8 @@ module tinker_core (
       fl_cnt        <= 32;
 
       for (i = 0; i < 32; i = i+1) begin
+        // arch_rf will be overwritten by testbench state loader;
+        // prf[i] must track it — initialise identically
         arch_rf[i]  = 64'd0;
         rat_map[i]  = i[PHYS_W-1:0];
         prf[i]      = 64'd0;
@@ -550,22 +551,29 @@ module tinker_core (
         prf[i]     = 0;
         prf_rdy[i] = 1;
       end
-      for (i = 0;  i < 32;      i = i+1) free_list[i] = 6'(32 + i);
-      for (i = 0;  i < ROB_SIZE; i = i+1) begin rob_valid[i] = 0; rob_done[i] = 0; end
-      for (i = 0;  i < RS_INT;   i = i+1) rs_v[i] = 0;
-      for (i = 0;  i < RS_FP;    i = i+1) fp_v[i] = 0;
-      for (i = 0;  i < LSQ_SIZE; i = i+1) begin lsq_v[i] = 0; lsq_isret[i] = 0; end
+      for (i = 0; i < 32; i = i+1) free_list[i] = 6'(32 + i);
 
-      alu_pd_p1 <= 0; alu_vs_p1 <= 0; alu_b_p1 <= 0; alu_pc_p1 <= 0;
-      alu_imovr_p1 <= 0; alu_imovi_p1 <= 0; alu_ical_p1 <= 0; alu_iret_p1 <= 0;
-      alu_ibr_p1 <= 0; alu_ijmp_p1 <= 0; alu_ibrreg_p1 <= 0; alu_ibrimm_p1 <= 0;
-      fp_pd_p[0] <= 0; fp_pd_p[1] <= 0; fp_pd_p[2] <= 0;
-      alu_vs_p <= 0; alu_pc_p <= 0;
-      alu_ibr_p <= 0; alu_ibgt_p <= 0; alu_ijmp_p <= 0;
-      alu_ibrreg_p <= 0; alu_ibrimm_p <= 0;
-      alu_imovr_p <= 0; alu_imovi_p <= 0; alu_ical_p <= 0; alu_iret_p <= 0;
-      alu_ptaken_p <= 0; alu_ptgt_p <= 0;
-      rf_commit_wen <= 0; rf_commit_waddr <= 0; rf_commit_data <= 0;
+      for (i = 0; i < ROB_SIZE;  i = i+1) begin rob_valid[i] = 0; rob_done[i] = 0; end
+      for (i = 0; i < RS_INT;    i = i+1) rs_v[i] = 0;
+      for (i = 0; i < RS_FP;     i = i+1) fp_v[i] = 0;
+      for (i = 0; i < LSQ_SIZE;  i = i+1) begin lsq_v[i] = 0; lsq_isret[i] = 0; end
+
+      // pipeline side-channel regs
+      alu_pd_p1      <= 0; alu_vs_p1     <= 0;
+      alu_imovr_p1   <= 0; alu_imovi_p1  <= 0;
+      alu_ical_p1    <= 0; alu_iret_p1   <= 0;
+      alu_ibr_p1     <= 0; alu_ijmp_p1   <= 0;
+      alu_ibrreg_p1  <= 0; alu_ibrimm_p1 <= 0;
+      alu_pc_p1      <= 0; alu_b_p1      <= 0;
+      fp_pd_p[0]     <= 0; fp_pd_p[1]    <= 0; fp_pd_p[2] <= 0;
+      alu_vs_p       <= 0; alu_pc_p      <= 0;
+      alu_ibr_p      <= 0; alu_ibgt_p    <= 0;
+      alu_ijmp_p     <= 0; alu_ibrreg_p  <= 0;
+      alu_ibrimm_p   <= 0; alu_imovr_p   <= 0;
+      alu_imovi_p    <= 0; alu_ical_p    <= 0;
+      alu_iret_p     <= 0; alu_ptaken_p  <= 0;
+      alu_ptgt_p     <= 0;
+      rf_commit_wen  <= 0; rf_commit_waddr <= 0; rf_commit_data <= 0;
 
     end else begin
 
@@ -577,17 +585,20 @@ module tinker_core (
       rf_commit_wen <= 0;
 
       // ================================================================
-      // PRF SYNC: mirror reg_file.registers[] into prf[0..31] for
-      // registers still at their identity mapping (not renamed/in-flight).
-      // The testbench loads initial register state into reg_file.registers
-      // AFTER reset completes, so we must continuously re-sync on each
-      // cycle for non-in-flight arch registers.
+      // CRITICAL: keep prf[0..31] in sync with reg_file.registers[]
+      // The testbench writes initial register state via the reg_file
+      // backdoor.  We mirror that by reading back on every cycle.
+      // On the first active cycle after reset the testbench has already
+      // loaded state, so we copy reg_file.registers -> prf / arch_rf
+      // for all arch regs that are still at their reset-RAT mapping.
       // ================================================================
+      // The cleanest approach: whenever rat_map[a] == a (identity, i.e.
+      // not yet renamed), prf[a] should equal the arch value from reg_file.
+      // We update prf[0..31] from reg_file every cycle where the entry
+      // is still at identity mapping AND prf_rdy is set (not in-flight).
       for (i = 0; i < 32; i = i+1) begin
-        if (rat_map[i] == i[PHYS_W-1:0] && prf_rdy[i]) begin
-          prf[i]     <= reg_file.registers[i];
-          arch_rf[i] <= reg_file.registers[i];
-        end
+        if (rat_map[i] == i[PHYS_W-1:0] && prf_rdy[i])
+          prf[i] <= reg_file.registers[i];
       end
 
       // ================================================================
@@ -598,10 +609,12 @@ module tinker_core (
         prf_rdy[c0pd]     <= 1;
         rob_done[c0rob]   <= 1;
         rob_result[c0rob] <= c0val;
+        // record actual branch/jump outcome in ROB
         if (alu_ibr_p1 || alu_ijmp_p1) begin
           rob_act_taken[c0rob] <= alu_act_taken_w;
           rob_act_tgt[c0rob]   <= alu_act_tgt_w;
         end
+        // wake up waiting RS entries
         for (i = 0; i < RS_INT; i = i+1) if (rs_v[i]) begin
           if (!rs_psrdy[i] && rs_ps[i] == c0pd) begin rs_psrdy[i] <= 1; rs_vs[i] <= c0val; end
           if (!rs_ptrdy[i] && rs_pt[i] == c0pd) begin rs_ptrdy[i] <= 1; rs_vt[i] <= c0val; end
@@ -621,7 +634,7 @@ module tinker_core (
         prf_rdy[c1pd]     <= 1;
         rob_done[c1rob]   <= 1;
         rob_result[c1rob] <= c1val;
-        // For return: the loaded value is the jump target; record in rob_act_tgt
+        // For return: the loaded value becomes the PC redirect target
         if (ld_done && ld_isret) begin
           rob_act_taken[c1rob] <= 1'b1;
           rob_act_tgt[c1rob]   <= ld_val;
@@ -653,6 +666,10 @@ module tinker_core (
 
           if (rob_has_dest[ch]) begin
             arch_rf[rob_arch[ch]] <= rob_result[ch];
+            // keep prf in sync for the (now-freed) physical reg that maps to arch
+            // The old mapping gets freed; the new phys reg carries the result.
+            // The arch reg itself may have been re-renamed, so only update the
+            // committed architectural copy and the physical reg.
             prf[rob_phys[ch]]     <= rob_result[ch];
             rf_commit_data        <= rob_result[ch];
             rf_commit_waddr       <= rob_arch[ch];
@@ -686,18 +703,21 @@ module tinker_core (
           rob_cnt       <= rob_cnt - 1;
 
           if (do_flush) begin
-            for (i = 0; i < RS_INT;    i = i+1) rs_v[i]  <= 0;
-            for (i = 0; i < RS_FP;     i = i+1) fp_v[i]  <= 0;
-            for (i = 0; i < LSQ_SIZE;  i = i+1) lsq_v[i] <= 0;
-            for (i = 0; i < ROB_SIZE;  i = i+1)
+            for (i = 0; i < RS_INT;   i = i+1) rs_v[i]      <= 0;
+            for (i = 0; i < RS_FP;    i = i+1) fp_v[i]      <= 0;
+            for (i = 0; i < LSQ_SIZE; i = i+1) lsq_v[i]     <= 0;
+            for (i = 0; i < ROB_SIZE; i = i+1)
               if (i[ROB_BITS-1:0] != ch) begin rob_valid[i] <= 0; rob_done[i] <= 0; end
-            // Restore RAT from committed arch state
+            // Restore RAT and prf from reg_file.registers[] which always holds
+            // the true committed architectural state (initial testbench values
+            // plus every rf_commit write). arch_rf is NOT used here because it
+            // is never seeded from the testbench's initial register load.
             for (i = 0; i < 32; i = i+1) begin
               rat_map[i]  <= i[PHYS_W-1:0];
-              prf[i]      <= arch_rf[i];
+              prf[i]      <= reg_file.registers[i];
               prf_rdy[i]  <= 1;
             end
-            prf[31] <= arch_rf[31];
+            prf[31] <= reg_file.registers[31];
             for (i = 32; i < NPHYS; i = i+1) prf_rdy[i] <= 1;
             for (i = 0;  i < 32;    i = i+1) free_list[i] <= 6'(32 + i);
             fl_head  <= 0;
@@ -743,6 +763,12 @@ module tinker_core (
         if (rs_iss_found) begin
           alu_en       <= 1;
           alu_op       <= rs_op[rs_iss_idx];
+          // For mov_reg  : a = src, b = don't-care
+          // For call/ret : a = src (jump target), b = don't-care
+          // For brr_reg  : a = rs value (offset), b = don't-care
+          // For brr_imm  : a = don't-care, b = imm (offset)
+          // For brnz/brgt: a = compare operand(s), b = operand-b
+          // For br abs   : a = target reg value
           alu_a        <= rs_vs[rs_iss_idx];
           alu_b        <= rs_uimm[rs_iss_idx] ? rs_imm[rs_iss_idx] : rs_vt[rs_iss_idx];
           alu_rtag     <= {1'b0, rs_rob[rs_iss_idx]};
@@ -788,7 +814,6 @@ module tinker_core (
         reg [63:0]        p0_vs,  p0_vt;
         reg               p0_psrdy, p0_ptrdy;
         reg [ROB_BITS-1:0] p0_rob;
-        // r31 phys reg (for call stack store and return stack load)
         reg [PHYS_W-1:0]  p0_r31_phys;
         reg [63:0]         p0_r31_val;
         reg                p0_r31_rdy;
@@ -821,13 +846,13 @@ module tinker_core (
 
         // -------- instr 0 --------
         if (d0_en) begin
-          p0_ps      = rat_map[d0_rs];
-          p0_pt      = rat_map[d0_rt];  // For call: d0_rt=r31 (from decoder fix)
-          p0_vs      = prf[p0_ps];
-          p0_vt      = prf[p0_pt];
-          p0_psrdy   = prf_rdy[p0_ps];
-          p0_ptrdy   = prf_rdy[p0_pt];
-          // r31 for call/return (always read r31's current phys mapping)
+          p0_ps    = rat_map[d0_rs];
+          p0_pt    = rat_map[d0_rt];  // for call: d0_rt = r31 (decoder fix)
+          p0_vs    = prf[p0_ps];
+          p0_vt    = prf[p0_pt];
+          p0_psrdy = prf_rdy[p0_ps];
+          p0_ptrdy = prf_rdy[p0_pt];
+          // r31 snapshot for call stack-push / return stack-load
           p0_r31_phys = rat_map[5'd31];
           p0_r31_val  = prf[p0_r31_phys];
           p0_r31_rdy  = prf_rdy[p0_r31_phys];
@@ -848,12 +873,13 @@ module tinker_core (
           rt     = rt + 1;
           rc     = rc + 1;
           rob_valid[p0_rob]      <= 1;
+          // call: rob_done=0 until ALU writes pc+4; return: rob_done=0 until load
           rob_done[p0_rob]       <= (!d0_wr || d0_hlt || d0_st || d0_ret) ? 1 : 0;
           rob_arch[p0_rob]       <= d0_rd;
           rob_phys[p0_rob]       <= p0_new;
           rob_old[p0_rob]        <= p0_old;
           rob_has_dest[p0_rob]   <= d0_wr;
-          rob_is_store[p0_rob]   <= d0_st || d0_call; // call also has a stack store
+          rob_is_store[p0_rob]   <= d0_st || d0_call; // call also pushes to stack
           rob_is_halt[p0_rob]    <= d0_hlt;
           rob_is_branch[p0_rob]  <= d0_br;
           rob_is_jump[p0_rob]    <= d0_jmp || d0_call || d0_ret;
@@ -864,7 +890,6 @@ module tinker_core (
           rob_act_tgt[p0_rob]    <= 0;
 
           if (d0_mem) begin
-            // Regular load/store
             lsq_v[lt]       <= 1;
             lsq_ld[lt]      <= d0_ld;
             lsq_st[lt]      <= d0_st;
@@ -882,16 +907,15 @@ module tinker_core (
             lt = lt + 1;
             lc = lc + 1;
           end else if (d0_call) begin
-            // call: dispatch RS entry for link-register write (rd=pc+4)
-            //       AND a store entry to push pc+4 onto stack at mem[r31-8]
-            // RS entry for jump+link (ical flag makes result=pc+4):
+            // call rd: rd = pc+4 (link register), jump to rd_old, push pc+4 to mem[r31-8]
+            // RS entry: ical flag makes c0val = pc+4 instead of ALU result
             rs_v[rs_free_slot]      <= 1;
-            rs_op[rs_free_slot]     <= 5'd0; // ADD (dummy, result overridden by ical)
-            rs_ps[rs_free_slot]     <= p0_ps;    // rd (jump target)
+            rs_op[rs_free_slot]     <= 5'd0;   // ADD placeholder
+            rs_ps[rs_free_slot]     <= p0_ps;  // rd = jump target
             rs_pt[rs_free_slot]     <= p0_ps;
             rs_psrdy[rs_free_slot]  <= p0_psrdy;
             rs_ptrdy[rs_free_slot]  <= 1;
-            rs_vs[rs_free_slot]     <= p0_vs;    // rd value = jump target
+            rs_vs[rs_free_slot]     <= p0_vs;  // rd value (jump target)
             rs_vt[rs_free_slot]     <= 64'd0;
             rs_imm[rs_free_slot]    <= 64'd0;
             rs_uimm[rs_free_slot]   <= 1;
@@ -909,48 +933,41 @@ module tinker_core (
             rs_ptaken[rs_free_slot] <= 0;
             rs_ptgt[rs_free_slot]   <= dq_pc0 + 64'd4;
             rsc = rsc + 1;
-            // Store entry: push pc+4 to mem[r31-8]
-            // data = pc+4 (known now), base = r31, imm = -8
-            // The store needs rob_commit before writing.  Give it a separate ROB entry.
-            // Actually the simplest is: mark this store as needing commit from p0_rob.
-            // We'll use a second LSQ slot with the same rob_tag (so it gets committed
-            // when the call's ROB entry commits).
+            // LSQ store: push pc+4 to mem[r31-8]
             lsq_v[lt]       <= 1;
             lsq_ld[lt]      <= 0;
             lsq_st[lt]      <= 1;
-            lsq_ardy[lt]    <= p0_r31_rdy;   // base=r31
-            lsq_drdy[lt]    <= 1;             // data=pc+4 known now
+            lsq_ardy[lt]    <= p0_r31_rdy;
+            lsq_drdy[lt]    <= 1;
             lsq_cmt[lt]     <= 0;
-            lsq_base[lt]    <= p0_r31_val;    // r31 value
-            lsq_data[lt]    <= dq_pc0 + 64'd4; // return address = pc+4
-            lsq_imm[lt]     <= 64'hFFFFFFFFFFFFFFF8; // -8 (signed)
+            lsq_base[lt]    <= p0_r31_val;
+            lsq_data[lt]    <= dq_pc0 + 64'd4;
+            lsq_imm[lt]     <= 64'hFFFFFFFFFFFFFFF8; // -8
             lsq_ps[lt]      <= p0_r31_phys;
-            lsq_pt[lt]      <= p0_r31_phys;   // unused for store data
+            lsq_pt[lt]      <= p0_r31_phys;
             lsq_pd[lt]      <= p0_new;
             lsq_rob[lt]     <= p0_rob;
             lsq_isret[lt]   <= 0;
             lt = lt + 1;
             lc = lc + 1;
           end else if (d0_ret) begin
-            // return: load from mem[r31-8], loaded value -> PC redirect
-            // No dest register (d0_wr=0, rob_done set immediately above)
-            // But we DO need the ROB to wait for the load to get the jump target.
-            // Override: mark rob_done=0 so commit waits for the load result.
+            // return: pc = mem[r31-8]. No dest register.
+            // Override rob_done=0: wait for load result before commit.
             rob_done[p0_rob] <= 0;
             lsq_v[lt]        <= 1;
             lsq_ld[lt]       <= 1;
             lsq_st[lt]       <= 0;
-            lsq_ardy[lt]     <= p0_psrdy;   // raddr1=r31
+            lsq_ardy[lt]     <= p0_psrdy;  // raddr1 = r31
             lsq_drdy[lt]     <= 1;
             lsq_cmt[lt]      <= 0;
-            lsq_base[lt]     <= p0_vs;      // r31 value
+            lsq_base[lt]     <= p0_vs;     // r31 value
             lsq_data[lt]     <= 64'd0;
             lsq_imm[lt]      <= 64'hFFFFFFFFFFFFFFF8; // -8
             lsq_ps[lt]       <= p0_ps;
             lsq_pt[lt]       <= p0_ps;
-            lsq_pd[lt]       <= p0_new;     // dummy phys dest (not written to arch)
+            lsq_pd[lt]       <= p0_new;
             lsq_rob[lt]      <= p0_rob;
-            lsq_isret[lt]    <= 1;          // signal: loaded value = jump target
+            lsq_isret[lt]    <= 1;   // loaded value becomes PC
             lt = lt + 1;
             lc = lc + 1;
           end else if (d0_fp) begin
@@ -994,12 +1011,12 @@ module tinker_core (
 
         // -------- instr 1 --------
         if (d1_en) begin
-          p1_ps      = (d0_en && d0_wr && d0_rd == d1_rs) ? p0_new : rat_map[d1_rs];
-          p1_pt      = (d0_en && d0_wr && d0_rd == d1_rt) ? p0_new : rat_map[d1_rt];
-          p1_vs      = prf[p1_ps];
-          p1_vt      = prf[p1_pt];
-          p1_psrdy   = prf_rdy[p1_ps];
-          p1_ptrdy   = prf_rdy[p1_pt];
+          p1_ps    = (d0_en && d0_wr && d0_rd == d1_rs) ? p0_new : rat_map[d1_rs];
+          p1_pt    = (d0_en && d0_wr && d0_rd == d1_rt) ? p0_new : rat_map[d1_rt];
+          p1_vs    = prf[p1_ps];
+          p1_vt    = prf[p1_pt];
+          p1_psrdy = prf_rdy[p1_ps];
+          p1_ptrdy = prf_rdy[p1_pt];
           p1_r31_phys = rat_map[5'd31];
           p1_r31_val  = prf[p1_r31_phys];
           p1_r31_rdy  = prf_rdy[p1_r31_phys];
@@ -1151,13 +1168,13 @@ module tinker_core (
               rs_pc[rslot]     <= dq_pc1;
               rs_ibr[rslot]    <= d1_br;
               rs_ibgt[rslot]   <= d1_brgt;
-              rs_ijmp[rslot]   <= d1_jmp;
+              rs_ijmp[rslot]   <= d1_jmp || d1_call || d1_ret;
               rs_ibrreg[rslot] <= d1_brrr;
               rs_ibrimm[rslot] <= d1_brri;
               rs_imovr[rslot]  <= d1_mvr;
               rs_imovi[rslot]  <= d1_mvi;
-              rs_ical[rslot]   <= 0;
-              rs_iret[rslot]   <= 0;
+              rs_ical[rslot]   <= d1_call;
+              rs_iret[rslot]   <= d1_ret;
               rs_ptaken[rslot] <= 0;
               rs_ptgt[rslot]   <= dq_pc1 + 64'd4;
               rsc = rsc + 1;
