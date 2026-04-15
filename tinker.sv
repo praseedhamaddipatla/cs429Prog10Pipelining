@@ -699,7 +699,6 @@ module tinker_core (
 
       // Trace load completions for memory debugging
       if (c1en && !rob_valid[c1rob])
-        $display("[LD_BLOCKED] cyc=%0d c1rob=%0d val=%0d - rob_valid=0!", $time/10, c1rob, c1val);
       if (c1en && rob_valid[c1rob]) begin
         prf[c1pd]         <= c1val;
         prf_rdy[c1pd]     <= 1;
@@ -764,15 +763,9 @@ module tinker_core (
             if (rob_pred_taken[ch] != rob_act_taken[ch] ||
                 (rob_act_taken[ch] && rob_pred_tgt[ch] != rob_act_tgt[ch])) begin
               do_flush         = 1;
-              flush_this_cycle = 1;  // blocking: dispatch_blk will see thi
-              $display("[FLUSH] cyc=%0d pc=0x%X act_taken=%b act_tgt=0x%X rob_head=%0d rob_cnt=%0d fl_cnt=%0d",
-                       $time/10, rob_pc[ch], rob_act_taken[ch], rob_act_tgt[ch],
-                       rob_head, rob_cnt, fl_cnt);
+              flush_this_cycle = 1;  // blocking: dispatch_blk will see this
               redirect_en <= 1;
               redirect_pc <= rob_act_taken[ch] ? rob_act_tgt[ch] : (rob_pc[ch] + 64'd4);
-              $display("[REDIR] cyc=%0d -> 0x%X (arch21=%0d arch26=%0d)",
-                       $time/10, rob_act_taken[ch] ? rob_act_tgt[ch] : (rob_pc[ch]+64'd4),
-                       arch_rf[21], arch_rf[26]);
             end
           end
 

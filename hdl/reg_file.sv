@@ -1,8 +1,6 @@
-// regfile.sv — architectural + physical register files
-// arch reg file: 32 regs, updated at commit
-// phys reg file: 64 regs, written by execution units
+// reg_file.sv — architectural register file
+// Yosys-compatible: no typed localparams, integer loop vars declared outside
 
-// architectural reg file (commit-only writes)
 module reg_file (
     input         clk,
     input         reset,
@@ -16,10 +14,8 @@ module reg_file (
     output [63:0] r2,
     output [63:0] r3
 );
-
     reg [63:0] registers [0:31];
 
-    // async read
     assign r1 = registers[raddr1];
     assign r2 = registers[raddr2];
     assign r3 = registers[raddr3];
@@ -29,13 +25,11 @@ module reg_file (
         if (reset) begin
             for (i = 0; i < 31; i = i + 1)
                 registers[i] <= 64'd0;
-            // r31 = stack ptr init = MEM_SIZE
             registers[31] <= 64'd524288;
         end else if (write && waddr != 5'd0) begin
             registers[waddr] <= data;
         end
     end
-
 endmodule
 
 

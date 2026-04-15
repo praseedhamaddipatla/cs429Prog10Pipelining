@@ -1,7 +1,5 @@
-// mem_module.sv — dual-port memory
-// port 0: 2x instr fetch (32-bit each)
-// port 1: data load/store (64-bit)
-// store writes committed — gated by we
+// memory.sv — dual-port memory
+// Yosys-compatible: no always @(*) 
 
 `ifndef MEM_SIZE
   `define MEM_SIZE (512 * 1024)
@@ -11,35 +9,28 @@ module memory #(
     parameter MEM_SIZE = `MEM_SIZE
 ) (
     input         clk,
-
-    // instr fetch ports (2 for dual-issue)
     input  [63:0] fetch_addr0,
     input  [63:0] fetch_addr1,
     output [31:0] instr_out0,
     output [31:0] instr_out1,
-
-    // data port
     input  [63:0] data_addr,
     input  [63:0] write_data,
     input         we,
     output [63:0] read_data
 );
-
     reg [7:0] bytes [0:MEM_SIZE-1];
 
-    // instr fetch — little-endian word
+    // Combinational reads — using assign (not always @(*)) as required
     assign instr_out0 = {bytes[fetch_addr0+3], bytes[fetch_addr0+2],
                          bytes[fetch_addr0+1], bytes[fetch_addr0]};
     assign instr_out1 = {bytes[fetch_addr1+3], bytes[fetch_addr1+2],
                          bytes[fetch_addr1+1], bytes[fetch_addr1]};
+    assign read_data  = {bytes[data_addr+7], bytes[data_addr+6],
+                         bytes[data_addr+5], bytes[data_addr+4],
+                         bytes[data_addr+3], bytes[data_addr+2],
+                         bytes[data_addr+1], bytes[data_addr]};
 
-    // data load — little-endian 64-bit
-    assign read_data = {bytes[data_addr+7], bytes[data_addr+6],
-                        bytes[data_addr+5], bytes[data_addr+4],
-                        bytes[data_addr+3], bytes[data_addr+2],
-                        bytes[data_addr+1], bytes[data_addr]};
-
-    // store (committed by rob)
+    // Clocked store
     always @(posedge clk) begin
         if (we) begin
             bytes[data_addr]   <= write_data[7:0];
@@ -52,7 +43,6 @@ module memory #(
             bytes[data_addr+7] <= write_data[63:56];
         end
     end
-
 endmodule
 
 // lsq.sv — load/store queue
