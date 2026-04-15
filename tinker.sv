@@ -813,7 +813,7 @@ module tinker_core (
         end
       end
 
-      if (!redirect_en && !call_pending && !ret_pending) begin : dispatch_blk
+      if (!redirect_en && !call_pending && !ret_pending && !flush_this_cycle) begin : dispatch_blk
         reg [PHYS_W-1:0] p0_new, p0_old, p0_ps, p0_pt;
         reg [63:0]        p0_vs,  p0_vt;
         reg               p0_psrdy, p0_ptrdy;
@@ -1106,19 +1106,16 @@ module tinker_core (
           end
         end
 
-        // Only update counts if no flush fired this cycle.
-        // When a flush fires, commit_blk already set them to 0 via NBAs.
-        // If we overwrite here, flush zeros are lost (dispatch NBAs are later).
-        if (!flush_this_cycle) begin
-          fl_head  <= fh;
-          fl_cnt   <= fc;
-          rob_tail <= rt;
-          rob_cnt  <= rc;
-          rs_cnt   <= rsc - (rs_iss_found ? 4'd1 : 4'd0);
-          fp_cnt   <= fpc - (fp_iss_found ? 3'd1 : 3'd0);
-          lsq_tail <= lt;
-          lsq_cnt  <= lc - (lsq_exec ? 5'd1 : 5'd0);
-        end
+        // Only update counts if no flush fired this cycle (already guaranteed by
+        // the outer !flush_this_cycle gate on dispatch_blk).
+        fl_head  <= fh;
+        fl_cnt   <= fc;
+        rob_tail <= rt;
+        rob_cnt  <= rc;
+        rs_cnt   <= rsc - (rs_iss_found ? 4'd1 : 4'd0);
+        fp_cnt   <= fpc - (fp_iss_found ? 3'd1 : 3'd0);
+        lsq_tail <= lt;
+        lsq_cnt  <= lc - (lsq_exec ? 5'd1 : 5'd0);
       end // dispatch_blk
 
       // When dispatch_blk is skipped (call/ret pending) but issue/LSQ still fires,
