@@ -1,4 +1,3 @@
-
 // tinker.sv — tinker cpu core (ooo, dual-issue)
 // optimizations: forwarding, multi-issue, ooo, pipelined fu, ls queue,
 //   deeper pipeline, branch prediction, register renaming
@@ -653,13 +652,14 @@ module tinker_core (
       // loaded state, so we copy reg_file.registers -> prf / arch_rf
       // for all arch regs that are still at their reset-RAT mapping.
       // ================================================================
-      // The cleanest approach: whenever rat_map[a] == a (identity, i.e.
-      // not yet renamed), prf[a] should equal the arch value from reg_file.
-      // We update prf[0..31] from reg_file every cycle where the entry
-      // is still at identity mapping AND prf_rdy is set (not in-flight).
+      // Keep prf and arch_rf in sync with reg_file.registers for identity-mapped
+      // registers.  arch_rf is used by flush-restore so it must reflect testbench-
+      // preloaded values as well as committed results.
       for (i = 0; i < 32; i = i+1) begin
-        if (rat_map[i] == i[PHYS_W-1:0] && prf_rdy[i])
-          prf[i] <= reg_file.registers[i];
+        if (rat_map[i] == i[PHYS_W-1:0] && prf_rdy[i]) begin
+          prf[i]    <= reg_file.registers[i];
+          arch_rf[i] <= reg_file.registers[i];
+        end
       end
 
       // ================================================================
@@ -773,16 +773,17 @@ module tinker_core (
             for (i = 0; i < LSQ_SIZE; i = i+1) begin lsq_v[i] <= 0; lsq_isret[i] <= 0; end
             for (i = 0; i < ROB_SIZE; i = i+1)
               if (i[ROB_BITS-1:0] != ch) begin rob_valid[i] <= 0; rob_done[i] <= 0; end
-            // Restore RAT and prf from reg_file.registers[] which always holds
-            // the true committed architectural state (initial testbench values
-            // plus every rf_commit write). arch_rf is NOT used here because it
-            // is never seeded from the testbench's initial register load.
+            // Restore RAT and prf from arch_rf[], which is updated in the same
+            // NBA region as this flush (commit_blk writes arch_rf[rob_arch[ch]]
+            // before reaching this point).  reg_file.registers[] is only updated
+            // at the NEXT posedge (via reg_file.sv's clocked write), so it would
+            // miss the result of the instruction being committed right now.
             for (i = 0; i < 32; i = i+1) begin
               rat_map[i]  <= i[PHYS_W-1:0];
-              prf[i]      <= reg_file.registers[i];
+              prf[i]      <= arch_rf[i];
               prf_rdy[i]  <= 1;
             end
-            prf[31] <= reg_file.registers[31];
+            prf[31] <= arch_rf[31];
             for (i = 32; i < NPHYS; i = i+1) prf_rdy[i] <= 1;
             for (i = 0;  i < 32;    i = i+1) free_list[i] <= 6'(32 + i);
             fl_head  <= 0;
