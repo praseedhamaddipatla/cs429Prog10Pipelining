@@ -197,7 +197,6 @@ module tinker_core (
   reg [63:0] alu_a, alu_b;
   reg [5:0]  alu_rtag;
   reg [PHYS_W-1:0] alu_pd;
-  reg [63:0]       alu_ibgt_tgt_p;   // brgt branch target (rt value)
 
   // Side-channel info for the cycle the ALU is fed
   reg [63:0] alu_vs_p, alu_pc_p;
@@ -388,8 +387,9 @@ module tinker_core (
   reg              alu_ibr_p1,   alu_ijmp_p1;
   reg              alu_ibrreg_p1, alu_ibrimm_p1;
   reg [63:0]       alu_pc_p1;
-  reg [63:0]       alu_b_p1;
-  reg [63:0]       alu_ibgt_tgt_p1;  // brgt target latched    // b operand (imm for brr_imm)
+  reg [63:0]       alu_b_p1;    // b operand (imm for brr_imm)
+  reg [63:0]       alu_ibgt_tgt_p;   // brgt: branch target (rt value)
+  reg [63:0]       alu_ibgt_tgt_p1;  // brgt: target latched
 
   always @(posedge clk) begin
     alu_pd_p1     <= alu_pd;
@@ -401,9 +401,10 @@ module tinker_core (
     alu_ibr_p1    <= alu_ibr_p;
     alu_ijmp_p1   <= alu_ijmp_p;
     alu_ibrreg_p1 <= alu_ibrreg_p;
-    alu_ibrimm_p1 <= alu_ibrimm_p;
-    alu_pc_p1     <= alu_pc_p;
-    alu_b_p1      <= alu_b;       // immediate / reg-b value
+    alu_ibrimm_p1   <= alu_ibrimm_p;
+    alu_pc_p1       <= alu_pc_p;
+    alu_b_p1        <= alu_b;       // immediate / reg-b value
+    alu_ibgt_tgt_p1 <= alu_ibgt_tgt_p;
   end
 
   // Result value on cdb0:
@@ -428,11 +429,11 @@ module tinker_core (
   //   return  : r31 value (absolute)
   //   br abs  : rs_value (absolute)
   wire [63:0] alu_act_tgt_w =
-      alu_ibrimm_p1  ? (alu_pc_p1 + alu_b_p1)   // brr L  — pc-relative imm
-    : alu_ibrreg_p1 ? (alu_pc_p1 + alu_vs_p1)  // brr rd — pc-relative reg
-    : alu_ibgt_p1   ? alu_ibgt_tgt_p1           // brgt — target is rt register (stored at dispatch)
-    : alu_ibr_p1    ? alu_b_p1                  // brnz — target is rd register (alu_b = rs_vt)
-    : alu_vs_p1;                                 // br/call/return — absolute (raddr1)
+      alu_ibrimm_p1    ? (alu_pc_p1 + alu_b_p1)   // brr L  — pc-relative imm
+    : alu_ibrreg_p1   ? (alu_pc_p1 + alu_vs_p1)  // brr rd — pc-relative reg
+    : alu_ibgt_tgt_p1 != 64'd0 ? alu_ibgt_tgt_p1 // brgt — rt value as target
+    : alu_ibr_p1      ? alu_b_p1                  // brnz  — rd value as target
+    : alu_vs_p1;                                   // br/call/return — absolute
 
   // cdb1: fp result or load result
   wire [PHYS_W-1:0] fp_pd   = fp_pd_p[2];
@@ -615,6 +616,7 @@ module tinker_core (
       alu_imovi_p    <= 0; alu_ical_p    <= 0;
       alu_iret_p     <= 0; alu_ptaken_p  <= 0;
       alu_ptgt_p     <= 0;
+      alu_ibgt_tgt_p <= 0; alu_ibgt_tgt_p1 <= 0;
       rf_commit_wen  <= 0; rf_commit_waddr <= 0; rf_commit_data <= 0;
 
     end else begin
@@ -658,10 +660,6 @@ module tinker_core (
       // Keep prf and arch_rf in sync with reg_file.registers for identity-mapped
       // registers.  arch_rf is used by flush-restore so it must reflect testbench-
       // preloaded values as well as committed results.
-      // prf_sync: mirror reg_file.registers into prf/arch_rf for identity-mapped regs.
-      // Skip during redirect cycles: the flush has already restored prf from arch_rf,
-      // and reg_file.registers may be one cycle behind (reg_file.sv has a 1-cycle write delay).
-      // Running prf_sync during redirect would overwrite the correct flushed values.
       if (!redirect_en) begin
         for (i = 0; i < 32; i = i+1) begin
           if (rat_map[i] == i[PHYS_W-1:0] && prf_rdy[i]) begin
@@ -1171,8 +1169,8 @@ module tinker_core (
           alu_pc_p     <= rs_pc[rs_iss_idx];
           alu_ibr_p    <= rs_ibr[rs_iss_idx];
           alu_ibgt_p     <= rs_ibgt[rs_iss_idx];
-          alu_ibgt_tgt_p <= rs_imm[rs_iss_idx];  // brgt: target addr stored in rs_imm at dispatch
-          alu_ijmp_p   <= rs_ijmp[rs_iss_idx];
+          alu_ibgt_tgt_p <= rs_ibgt[rs_iss_idx] ? rs_imm[rs_iss_idx] : 64'd0;
+          alu_ijmp_p     <= rs_ijmp[rs_iss_idx];
           alu_ibrreg_p <= rs_ibrreg[rs_iss_idx];
           alu_ibrimm_p <= rs_ibrimm[rs_iss_idx];
           alu_imovr_p  <= rs_imovr[rs_iss_idx];
