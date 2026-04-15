@@ -472,6 +472,9 @@ module tinker_core (
   // Blocking flag: set to 1 in commit_blk when a flush fires, read by dispatch_blk.
   // This is a module-level variable used as a blocking wire across named blocks.
   reg        flush_this_cycle;
+  // Blocking vars tracking what commit_blk did this cycle, read by dispatch_blk.
+  reg        commit_happened;   // 1 if ROB committed an entry this cycle
+  reg        commit_freed_reg;  // 1 if that commit freed a phys reg (rob_has_dest)
 
   // Call/return bypass registers — these handle call and return entirely outside
   // the OOO pipeline, mirroring the multicycle processor's direct approach.
@@ -614,6 +617,8 @@ module tinker_core (
     end else begin
 
       flush_this_cycle = 0;  // blocking: cleared before commit_blk runs
+      commit_happened   = 0;
+      commit_freed_reg  = 0;
       redirect_en   <= 0;
       alu_en        <= 0;
       fpu_en        <= 0;
@@ -758,6 +763,8 @@ module tinker_core (
           rob_done[ch]  <= 0;
           rob_head      <= ch + 1;
           rob_cnt       <= rob_cnt - 1;
+          commit_happened  = 1;  // blocking: dispatch_blk will subtract 1 from rc
+          commit_freed_reg = rob_has_dest[ch];  // blocking: dispatch_blk will add 1 to fc
 
           if (do_flush) begin
             for (i = 0; i < RS_INT;   i = i+1) rs_v[i]      <= 0;
@@ -1108,10 +1115,13 @@ module tinker_core (
 
         // Only update counts if no flush fired this cycle (already guaranteed by
         // the outer !flush_this_cycle gate on dispatch_blk).
+        // Subtract 1 from rc/fc if commit_blk fired a commit/free this cycle,
+        // since the commit NBAs (rob_cnt<=rob_cnt-1, fl_cnt<=fl_cnt+1) would
+        // otherwise be overwritten by these later dispatch NBAs.
         fl_head  <= fh;
-        fl_cnt   <= fc;
+        fl_cnt   <= fc + (commit_freed_reg ? 6'd1 : 6'd0);  // +1 if commit freed a reg
         rob_tail <= rt;
-        rob_cnt  <= rc;
+        rob_cnt  <= rc - {{ROB_BITS{1'b0}}, commit_happened};  // -1 if commit fired
         rs_cnt   <= rsc - (rs_iss_found ? 4'd1 : 4'd0);
         fp_cnt   <= fpc - (fp_iss_found ? 3'd1 : 3'd0);
         lsq_tail <= lt;
