@@ -428,7 +428,8 @@ module tinker_core (
   wire [63:0] alu_act_tgt_w =
       alu_ibrimm_p1 ? (alu_pc_p1 + alu_b_p1)   // brr L  — pc-relative imm
     : alu_ibrreg_p1 ? (alu_pc_p1 + alu_vs_p1)  // brr rd — pc-relative reg
-    : alu_vs_p1;                                 // br/call/return — absolute
+    : alu_ibr_p1    ? alu_b_p1                  // brnz/brgt — target is raddr2 (alu_b)
+    : alu_vs_p1;                                 // br/call/return — absolute (raddr1)
 
   // cdb1: fp result or load result
   wire [PHYS_W-1:0] fp_pd   = fp_pd_p[2];
