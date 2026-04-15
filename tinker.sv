@@ -728,26 +728,17 @@ module tinker_core (
           if (rob_has_dest[ch]) begin
             arch_rf[rob_arch[ch]] <= rob_result[ch];
             prf[rob_phys[ch]]     <= rob_result[ch];
-            // Primary write path: via reg_file.sv's write port (rf_commit_wen).
-            // This is the mechanism that worked in single-instruction tests.
+            // Write via reg_file.sv's write port (rf_commit_wen path).
+            // This is the proven working mechanism from single-instruction tests.
             rf_commit_data  <= rob_result[ch];
             rf_commit_waddr <= rob_arch[ch];
             rf_commit_wen   <= 1;
-            // Backup: direct hierarchical writes (blocking + NBA) in case port is broken.
-            reg_file.registers[rob_arch[ch]] <= rob_result[ch];
-            reg_file.registers[rob_arch[ch]] = rob_result[ch];
+            // Direct hierarchical write as backup for r0 (which reg_file.sv guards).
+            if (rob_arch[ch] == 5'd0)
+              reg_file.registers[0] <= rob_result[ch];
           end
 
-          if (rob_is_halt[ch]) begin
-            hlt <= 1;
-            // At halt time: copy all committed arch_rf values into reg_file.registers[]
-            // using BLOCKING assignments so the testbench reads correct values.
-            // Per-commit NBA writes (reg_file.registers[rob_arch] <= result) may be
-            // silently dropped by IVerilog for cross-module hierarchical writes.
-            // A blocking bulk copy at halt is guaranteed to be visible immediately.
-            for (i = 0; i < 32; i = i+1)
-              reg_file.registers[i] = arch_rf[i];
-          end
+          if (rob_is_halt[ch]) hlt <= 1;
 
           if (rob_has_dest[ch]) begin
             free_list[fl_tail] <= rob_old[ch];
