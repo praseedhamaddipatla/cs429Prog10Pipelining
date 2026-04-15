@@ -994,8 +994,11 @@ module tinker_core (
           p1_pt    = (d0_en && d0_wr && d0_rd == d1_rt) ? p0_new : rat_map[d1_rt];
           p1_vs    = prf[p1_ps];
           p1_vt    = prf[p1_pt];
-          p1_psrdy = prf_rdy[p1_ps];
-          p1_ptrdy = prf_rdy[p1_pt];
+          // KEY FIX: when p1 sources d0's freshly-allocated phys reg (p0_new),
+          // prf_rdy[p0_new] is stale (still 1 from reset) because the NBA
+          // prf_rdy[p0_new]<=0 hasn't applied yet.  Force psrdy=0 in that case.
+          p1_psrdy = (d0_en && d0_wr && d0_rd == d1_rs) ? 1'b0 : prf_rdy[p1_ps];
+          p1_ptrdy = (d0_en && d0_wr && d0_rd == d1_rt) ? 1'b0 : prf_rdy[p1_pt];
           p1_r31_phys = rat_map[5'd31];
           p1_r31_val  = prf[p1_r31_phys];
           p1_r31_rdy  = prf_rdy[p1_r31_phys];
