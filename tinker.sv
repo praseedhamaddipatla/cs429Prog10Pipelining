@@ -767,7 +767,7 @@ module tinker_core (
               flush_this_cycle = 1;  // blocking: dispatch_blk will see thi
               $display("[FLUSH] cyc=%0d pc=0x%X act_taken=%b act_tgt=0x%X rob_head=%0d rob_cnt=%0d fl_cnt=%0d",
                        $time/10, rob_pc[ch], rob_act_taken[ch], rob_act_tgt[ch],
-                       rob_head, rob_cnt, fl_cnt);s
+                       rob_head, rob_cnt, fl_cnt);
               redirect_en <= 1;
               redirect_pc <= rob_act_taken[ch] ? rob_act_tgt[ch] : (rob_pc[ch] + 64'd4);
               $display("[REDIR] cyc=%0d -> 0x%X (arch21=%0d arch26=%0d)",

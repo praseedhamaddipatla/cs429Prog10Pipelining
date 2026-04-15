@@ -1,11 +1,11 @@
 // diag_tb.sv — Targeted diagnostic testbench: branch + memory failures
 // Tests progressively harder cases; first failure pinpoints the exact bug.
 //
-// Compile (from project root):
-//   iverilog -g2005-sv -o diag_tb.vvp diag_tb.sv tinker.sv \
-//            hdl/alu.sv hdl/fpu.sv hdl/reg_file.sv hdl/decoder.sv \
-//            hdl/fetch.sv hdl/memory.sv
+// Compile (from project root - tinker.sv already `include`s all hdl/ files):
+//   iverilog -g2005-sv -o diag_tb.vvp diag_tb.sv tinker.sv
 // Run:  vvp diag_tb.vvp
+// NOTE: Do NOT pass hdl/*.sv files separately - tinker.sv `include`s them already.
+//       Passing them separately causes duplicate module definitions (silent wrong behavior).
 
 `timescale 1ns/1ps
 `define MEM_SIZE  (512 * 1024)
