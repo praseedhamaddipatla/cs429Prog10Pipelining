@@ -663,8 +663,8 @@ module tinker_core (
       if (!redirect_en) begin
         for (i = 0; i < 32; i = i+1) begin
           if (rat_map[i] == i[PHYS_W-1:0] && prf_rdy[i]) begin
-            prf[i]    = reg_file.registers[i];
-            arch_rf[i] = reg_file.registers[i];
+            prf[i]    <= reg_file.registers[i];
+            arch_rf[i] <= reg_file.registers[i];
           end
         end
       end
@@ -733,8 +733,8 @@ module tinker_core (
         if (rob_cnt > 0 && rob_valid[ch] && rob_done[ch]) begin
 
           if (rob_has_dest[ch]) begin
-            arch_rf[rob_arch[ch]] = rob_result[ch];
-            prf[rob_phys[ch]]     = rob_result[ch];
+            arch_rf[rob_arch[ch]] <= rob_result[ch];
+            prf[rob_phys[ch]]     <= rob_result[ch];
             // Write via reg_file.sv's write port (rf_commit_wen path).
             // This is the proven working mechanism from single-instruction tests.
             rf_commit_data  <= rob_result[ch];
@@ -742,7 +742,7 @@ module tinker_core (
             rf_commit_wen   <= 1;
             // Direct hierarchical write as backup for r0 (which reg_file.sv guards).
             if (rob_arch[ch] == 5'd0)
-              reg_file.registers[0] = rob_result[ch];
+              reg_file.registers[0] <= rob_result[ch];
           end
 
           if (rob_is_halt[ch]) hlt <= 1;
@@ -790,7 +790,7 @@ module tinker_core (
               prf[i]      <= arch_rf[i];
               prf_rdy[i]  <= 1;
             end
-            prf[31] = arch_rf[31];
+            prf[31] <= arch_rf[31];
             for (i = 32; i < NPHYS; i = i+1) prf_rdy[i] <= 1;
             for (i = 0;  i < 32;    i = i+1) free_list[i] <= 6'(32 + i);
             fl_head  <= 0;
