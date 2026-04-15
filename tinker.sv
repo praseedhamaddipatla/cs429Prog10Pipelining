@@ -469,6 +469,9 @@ module tinker_core (
   // ---------------------------------------------------------------------------
   reg        redirect_en;
   reg [63:0] redirect_pc;
+  // Blocking flag: set to 1 in commit_blk when a flush fires, read by dispatch_blk.
+  // This is a module-level variable used as a blocking wire across named blocks.
+  reg        flush_this_cycle;
 
   // Call/return bypass registers — these handle call and return entirely outside
   // the OOO pipeline, mirroring the multicycle processor's direct approach.
@@ -545,6 +548,7 @@ module tinker_core (
     if (reset) begin
       hlt           <= 0;
       pc_reg        <= `PC_START;
+      flush_this_cycle = 0;
       dq_v0         <= 0;
       dq_v1         <= 0;
       redirect_en   <= 0;
@@ -609,6 +613,7 @@ module tinker_core (
 
     end else begin
 
+      flush_this_cycle = 0;  // blocking: cleared before commit_blk runs
       redirect_en   <= 0;
       alu_en        <= 0;
       fpu_en        <= 0;
@@ -742,7 +747,8 @@ module tinker_core (
           if (rob_is_branch[ch] || rob_is_jump[ch]) begin
             if (rob_pred_taken[ch] != rob_act_taken[ch] ||
                 (rob_act_taken[ch] && rob_pred_tgt[ch] != rob_act_tgt[ch])) begin
-              do_flush    = 1;
+              do_flush         = 1;
+              flush_this_cycle = 1;  // blocking: dispatch_blk will see this
               redirect_en <= 1;
               redirect_pc <= rob_act_taken[ch] ? rob_act_tgt[ch] : (rob_pc[ch] + 64'd4);
             end
@@ -1100,16 +1106,19 @@ module tinker_core (
           end
         end
 
-        fl_head  <= fh;
-        fl_cnt   <= fc;
-        rob_tail <= rt;
-        rob_cnt  <= rc;
-        // Single NBA write accounts for both dispatch increments AND issue decrements.
-        // rs_iss_found / fp_iss_found are combinatorial wires evaluated before this block.
-        rs_cnt   <= rsc - (rs_iss_found ? 4'd1 : 4'd0);
-        fp_cnt   <= fpc - (fp_iss_found ? 3'd1 : 3'd0);
-        lsq_tail <= lt;
-        lsq_cnt  <= lc - (lsq_exec ? 5'd1 : 5'd0);
+        // Only update counts if no flush fired this cycle.
+        // When a flush fires, commit_blk already set them to 0 via NBAs.
+        // If we overwrite here, flush zeros are lost (dispatch NBAs are later).
+        if (!flush_this_cycle) begin
+          fl_head  <= fh;
+          fl_cnt   <= fc;
+          rob_tail <= rt;
+          rob_cnt  <= rc;
+          rs_cnt   <= rsc - (rs_iss_found ? 4'd1 : 4'd0);
+          fp_cnt   <= fpc - (fp_iss_found ? 3'd1 : 3'd0);
+          lsq_tail <= lt;
+          lsq_cnt  <= lc - (lsq_exec ? 5'd1 : 5'd0);
+        end
       end // dispatch_blk
 
       // When dispatch_blk is skipped (call/ret pending) but issue/LSQ still fires,
