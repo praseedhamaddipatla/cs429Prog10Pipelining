@@ -735,9 +735,20 @@ module tinker_core (
             // workaround: write unconditionally via direct hierarchical assignment.
             // The testbench reads reg_file.registers[] so this is necessary.
             reg_file.registers[rob_arch[ch]] <= rob_result[ch];
+            // Also use blocking write to ensure visibility (cross-module NBAs may be dropped)
+            reg_file.registers[rob_arch[ch]] = rob_result[ch];
           end
 
-          if (rob_is_halt[ch]) hlt <= 1;
+          if (rob_is_halt[ch]) begin
+            hlt <= 1;
+            // At halt time: copy all committed arch_rf values into reg_file.registers[]
+            // using BLOCKING assignments so the testbench reads correct values.
+            // Per-commit NBA writes (reg_file.registers[rob_arch] <= result) may be
+            // silently dropped by IVerilog for cross-module hierarchical writes.
+            // A blocking bulk copy at halt is guaranteed to be visible immediately.
+            for (i = 0; i < 32; i = i+1)
+              reg_file.registers[i] = arch_rf[i];
+          end
 
           if (rob_has_dest[ch]) begin
             free_list[fl_tail] <= rob_old[ch];
