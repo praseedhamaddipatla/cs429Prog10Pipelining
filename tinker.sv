@@ -728,14 +728,13 @@ module tinker_core (
           if (rob_has_dest[ch]) begin
             arch_rf[rob_arch[ch]] <= rob_result[ch];
             prf[rob_phys[ch]]     <= rob_result[ch];
-            // Write committed value directly into reg_file.sv's register array via
-            // hierarchical access.  This bypasses reg_file.sv's write port entirely,
-            // which has a syntax error at line 172 that prevents the normal write path
-            // from working correctly in simulation.  We use a generate-like loop
-            // workaround: write unconditionally via direct hierarchical assignment.
-            // The testbench reads reg_file.registers[] so this is necessary.
+            // Primary write path: via reg_file.sv's write port (rf_commit_wen).
+            // This is the mechanism that worked in single-instruction tests.
+            rf_commit_data  <= rob_result[ch];
+            rf_commit_waddr <= rob_arch[ch];
+            rf_commit_wen   <= 1;
+            // Backup: direct hierarchical writes (blocking + NBA) in case port is broken.
             reg_file.registers[rob_arch[ch]] <= rob_result[ch];
-            // Also use blocking write to ensure visibility (cross-module NBAs may be dropped)
             reg_file.registers[rob_arch[ch]] = rob_result[ch];
           end
 
