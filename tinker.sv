@@ -665,7 +665,7 @@ module tinker_core (
       // ================================================================
       // A. CDB BROADCAST
       // ================================================================
-      if (c0en) begin
+      if (c0en && rob_valid[c0rob]) begin
         prf[c0pd]         <= c0val;
         prf_rdy[c0pd]     <= 1;
         rob_done[c0rob]   <= 1;
@@ -690,7 +690,7 @@ module tinker_core (
         end
       end
 
-      if (c1en) begin
+      if (c1en && rob_valid[c1rob]) begin
         prf[c1pd]         <= c1val;
         prf_rdy[c1pd]     <= 1;
         rob_done[c1rob]   <= 1;
