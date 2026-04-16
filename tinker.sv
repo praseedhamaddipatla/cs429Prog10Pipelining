@@ -911,7 +911,7 @@ module tinker_core (
           rt     = rt + 1;
           rc     = rc + 1;
           rob_valid[p0_rob]      <= 1;
-          rob_done[p0_rob]       <= (!d0_wr || d0_hlt || d0_st) ? 1 : 0;
+          rob_done[p0_rob]       <= ((!d0_wr || d0_hlt || d0_st) && !(d0_br && !d0_brgt) && !(d0_jmp && !d0_brrr && !d0_brri)) ? 1 : 0;
           rob_arch[p0_rob]       <= d0_rd;
           rob_phys[p0_rob]       <= p0_new;
           rob_old[p0_rob]        <= p0_old;
@@ -1044,7 +1044,7 @@ module tinker_core (
           rt     = rt + 1;
           rc     = rc + 1;
           rob_valid[p1_rob]      <= 1;
-          rob_done[p1_rob]       <= (!d1_wr || d1_hlt || d1_st) ? 1 : 0;
+          rob_done[p1_rob]       <= ((!d1_wr || d1_hlt || d1_st) && !(d1_br && !d1_brgt) && !(d1_jmp && !d1_brrr && !d1_brri)) ? 1 : 0;
           rob_arch[p1_rob]       <= d1_rd;
           rob_phys[p1_rob]       <= p1_new;
           rob_old[p1_rob]        <= p1_old;
