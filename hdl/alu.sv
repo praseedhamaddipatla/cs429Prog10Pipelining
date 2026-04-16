@@ -1,7 +1,14 @@
+
 // alu.sv — pipelined alu + fpu
 // int ops : 1-cycle latency (alu_int)
 // fp ops  : 3-cycle latency (fpu_addsub / fpu_mul / fpu_div)
+// results broadcast on valid_out pulse with rob_tag passthrough
+// key fix: all intermediate pipeline values stored in top-level module regs,
+//          not as local vars inside named blocks — ensures correct pipelining
 
+// ---------------------------------------------------------------------------
+// alu_int — single-cycle integer / branch / compare unit
+// ---------------------------------------------------------------------------
 module alu (
     input         clk,
     input         reset,

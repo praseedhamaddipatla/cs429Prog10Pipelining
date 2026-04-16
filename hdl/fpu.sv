@@ -13,10 +13,16 @@ module fpu (
 
     localparam FADD=0, FSUB=1, FMUL=2, FDIV=3;
 
+    // -------------------------
+    // wires from submodules
+    // -------------------------
     wire add_valid, mul_valid, div_valid;
     wire [63:0] add_res, mul_res, div_res;
     wire [5:0] add_tag, mul_tag, div_tag;
 
+    // -------------------------
+    // instantiate pipelines
+    // -------------------------
     fpu_addsub u_addsub (
         .clk(clk),
         .reset(reset),
@@ -54,6 +60,9 @@ module fpu (
         .rob_tag_out(div_tag)
     );
 
+    // -------------------------
+    // output mux (unchanged timing)
+    // -------------------------
     assign valid_out =
         add_valid | mul_valid | div_valid;
 
@@ -72,6 +81,13 @@ module fpu (
 endmodule
 
 
+// ---------------------------------------------------------------------------
+// fpu_addsub — 3-stage pipelined fp add/sub
+// stage 0: unpack + align mantissas
+// stage 1: add/sub aligned mantissas
+// stage 2: normalize + round → output
+// All intermediate values are top-level module regs, not local block vars.
+// ---------------------------------------------------------------------------
 module fpu_addsub (
     input         clk,
     input         reset,
@@ -85,6 +101,7 @@ module fpu_addsub (
     output reg [5:0]  rob_tag_out
 );
 
+    // ---- stage 0 pipeline regs ----
     reg        s0_valid;
     reg [5:0]  s0_tag;
     reg        s0_special;
@@ -93,6 +110,7 @@ module fpu_addsub (
     reg [10:0] s0_er;
     reg [55:0] s0_ax, s0_ay;
 
+    // ---- stage 1 pipeline regs ----
     reg        s1_valid;
     reg [5:0]  s1_tag;
     reg        s1_special;
@@ -101,6 +119,9 @@ module fpu_addsub (
     reg [10:0] s1_er;
     reg [56:0] s1_sum;
 
+    // ================================================================
+    // stage 0: unpack, detect specials, align mantissas
+    // ================================================================
     always @(posedge clk) begin
         if (reset) begin
             s0_valid <= 0;
@@ -171,6 +192,9 @@ module fpu_addsub (
         end
     end
 
+    // ================================================================
+    // stage 1: add or subtract aligned mantissas
+    // ================================================================
     always @(posedge clk) begin
         if (reset) begin
             s1_valid <= 0;
@@ -194,6 +218,9 @@ module fpu_addsub (
         end
     end
 
+    // ================================================================
+    // stage 2: normalize + round → output
+    // ================================================================
     always @(posedge clk) begin
         if (reset) begin
             valid_out <= 0;
@@ -216,10 +243,12 @@ module fpu_addsub (
                 er = s1_er;
 
                 if (s[55]) begin
+                    // carry out — shift right 1
                     mr    = {1'b0, s[55:3]};
                     guard = s[2]; rb = s[1]; sticky = s[0];
                     er    = er + 1;
                 end else begin
+                    // shift left until leading 1 at bit 54
                     shift_cnt = 0;
                     while (s[54] == 0 && s != 0 && shift_cnt < 56) begin
                         s = s << 1;
@@ -241,6 +270,12 @@ module fpu_addsub (
 endmodule
 
 
+// ---------------------------------------------------------------------------
+// fpu_mul — 3-stage pipelined fp multiply
+// stage 0: unpack, detect specials, compute biased result exponent
+// stage 1: 53×53 → 106-bit integer mantissa product
+// stage 2: normalize + round → output
+// ---------------------------------------------------------------------------
 module fpu_mul (
     input         clk,
     input         reset,
@@ -253,6 +288,7 @@ module fpu_mul (
     output reg [5:0]  rob_tag_out
 );
 
+    // stage 0 regs
     reg        s0_valid;
     reg [5:0]  s0_tag;
     reg        s0_special;
@@ -261,6 +297,7 @@ module fpu_mul (
     reg [10:0] s0_er;
     reg [52:0] s0_mx, s0_my;
 
+    // stage 1 regs
     reg        s1_valid;
     reg [5:0]  s1_tag;
     reg        s1_special;
@@ -269,6 +306,7 @@ module fpu_mul (
     reg [10:0] s1_er;
     reg [105:0] s1_prod;
 
+    // ---- stage 0 ----
     always @(posedge clk) begin
         if (reset) begin
             s0_valid <= 0;
@@ -277,6 +315,7 @@ module fpu_mul (
             s0_tag     <= rob_tag_in;
             s0_special <= 0; s0_special_val <= 0;
             s0_sr<=0; s0_er<=0; s0_mx<=0; s0_my<=0;
+
             if (valid_in) begin : s0l
                 reg        sx, sy, sr;
                 reg [10:0] ex, ey, er;
@@ -308,6 +347,7 @@ module fpu_mul (
         end
     end
 
+    // ---- stage 1: product ----
     always @(posedge clk) begin
         if (reset) begin s1_valid<=0; end
         else begin
@@ -321,6 +361,7 @@ module fpu_mul (
         end
     end
 
+    // ---- stage 2: normalize + round ----
     always @(posedge clk) begin
         if (reset) begin valid_out<=0; end
         else begin
@@ -355,6 +396,12 @@ module fpu_mul (
 endmodule
 
 
+// ---------------------------------------------------------------------------
+// fpu_div — 3-stage pipelined fp divide
+// stage 0: unpack
+// stage 1: integer division for 54-bit quotient
+// stage 2: normalize + round → output
+// ---------------------------------------------------------------------------
 module fpu_div (
     input         clk,
     input         reset,
@@ -367,6 +414,7 @@ module fpu_div (
     output reg [5:0]  rob_tag_out
 );
 
+    // stage 0 regs
     reg        s0_valid;
     reg [5:0]  s0_tag;
     reg        s0_special;
@@ -375,6 +423,7 @@ module fpu_div (
     reg [12:0] s0_er;
     reg [52:0] s0_mx, s0_my;
 
+    // stage 1 regs
     reg        s1_valid;
     reg [5:0]  s1_tag;
     reg        s1_special;
@@ -383,6 +432,7 @@ module fpu_div (
     reg [12:0] s1_er;
     reg [105:0] s1_qr, s1_rem;
 
+    // ---- stage 0 ----
     always @(posedge clk) begin
         if (reset) begin s0_valid<=0; end
         else begin
@@ -427,6 +477,7 @@ module fpu_div (
         end
     end
 
+    // ---- stage 1: integer division ----
     always @(posedge clk) begin
         if (reset) begin s1_valid<=0; end
         else begin
@@ -445,6 +496,7 @@ module fpu_div (
         end
     end
 
+    // ---- stage 2: normalize + round ----
     always @(posedge clk) begin
         if (reset) begin valid_out<=0; end
         else begin

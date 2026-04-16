@@ -1,3 +1,4 @@
+
 // tinker.sv — tinker cpu core (ooo, dual-issue)
 // optimizations: forwarding, multi-issue, ooo, pipelined fu, ls queue,
 //   deeper pipeline, branch prediction, register renaming
@@ -142,7 +143,7 @@ module tinker_core (
   reg [ROB_BITS-1:0] lsq_rob[0:LSQ_SIZE-1];
   reg              lsq_isret[0:LSQ_SIZE-1]; // load result becomes PC (return)
 
-  reg [2:0] lsq_head, lsq_tail;  // 3-bit: wraps at LSQ_SIZE=8
+  reg [3:0] lsq_head, lsq_tail;
   reg [4:0] lsq_cnt;
   wire lsq_full = (lsq_cnt >= LSQ_SIZE - 2); // -2: call uses 2 LSQ slots
 
@@ -697,8 +698,6 @@ module tinker_core (
         end
       end
 
-      // Trace load completions for memory debugging
-      if (c1en && !rob_valid[c1rob])
       if (c1en && rob_valid[c1rob]) begin
         prf[c1pd]         <= c1val;
         prf_rdy[c1pd]     <= 1;

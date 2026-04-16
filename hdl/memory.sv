@@ -1,4 +1,9 @@
+
 // mem_module.sv — dual-port memory
+// port 0: 2x instr fetch (32-bit each)
+// port 1: data load/store (64-bit)
+// store writes committed — gated by we
+
 `ifndef MEM_SIZE
   `define MEM_SIZE (512 * 1024)
 `endif
@@ -7,10 +12,14 @@ module memory #(
     parameter MEM_SIZE = `MEM_SIZE
 ) (
     input         clk,
+
+    // instr fetch ports (2 for dual-issue)
     input  [63:0] fetch_addr0,
     input  [63:0] fetch_addr1,
     output [31:0] instr_out0,
     output [31:0] instr_out1,
+
+    // data port
     input  [63:0] data_addr,
     input  [63:0] write_data,
     input         we,

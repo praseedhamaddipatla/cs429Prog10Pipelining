@@ -1,5 +1,8 @@
 // regfile.sv — architectural + physical register files
+// arch reg file: 32 regs, updated at commit
+// phys reg file: 64 regs, written by execution units
 
+// architectural reg file (commit-only writes)
 module reg_file (
     input         clk,
     input         reset,
