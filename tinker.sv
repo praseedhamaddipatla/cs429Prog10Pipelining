@@ -130,6 +130,8 @@ module tinker_core (
   reg dq_v0, dq_v1;
   reg [31:0] dq_i0, dq_i1;
   reg [63:0] dq_pc0, dq_pc1;
+  reg        dq_ptaken0, dq_ptaken1;
+  reg [63:0] dq_ptgt0,   dq_ptgt1;
 
   wire [4:0] d0_rs, d0_rt, d0_rd, d0_rtx;
   wire [63:0] d0_imm;
@@ -150,7 +152,7 @@ module tinker_core (
   wire       stall = rob_full || rs_full || fp_full || lsq_full;
   wire       d0_en = dq_v0 && !stall;
   wire       d0_ctrl = d0_jmp || d0_br || d0_call || d0_ret;
-  wire       d1_en = dq_v1 && !stall && !d0_hlt && !d0_ctrl;
+  wire       d1_en = dq_v1 && !stall && !d0_hlt && !(d0_en && d0_ctrl);
 
   reg        alu_en;
   reg  [4:0] alu_op;
@@ -241,6 +243,26 @@ module tinker_core (
       .write_data(lsq_mwdata),
       .we(lsq_mwe),
       .read_data(lsq_mrdata)
+  );
+
+  wire        bp_pred_taken0, bp_pred_taken1;
+  wire [63:0] bp_pred_target0, bp_pred_target1;
+  wire        bp_hit0, bp_hit1;
+
+  branch_predictor u_bp0 (
+      .clk(clk), .reset(reset),
+      .pc(pc_reg),
+      .pred_taken(bp_pred_taken0), .pred_target(bp_pred_target0), .btb_hit(bp_hit0),
+      .upd_en(bp_upd_en), .upd_pc(bp_upd_pc),
+      .upd_taken(bp_upd_taken), .upd_target(bp_upd_target)
+  );
+
+  branch_predictor u_bp1 (
+      .clk(clk), .reset(reset),
+      .pc(pc_reg + 64'd4),
+      .pred_taken(bp_pred_taken1), .pred_target(bp_pred_target1), .btb_hit(bp_hit1),
+      .upd_en(bp_upd_en), .upd_pc(bp_upd_pc),
+      .upd_taken(bp_upd_taken), .upd_target(bp_upd_target)
   );
 
   reg [63:0] rf_commit_data;
@@ -393,6 +415,10 @@ module tinker_core (
   reg        redirect_en;
   reg [63:0] redirect_pc;
   reg        flush_this_cycle;
+  reg        bp_upd_en;
+  reg [63:0] bp_upd_pc;
+  reg        bp_upd_taken;
+  reg [63:0] bp_upd_target;
   reg        commit_happened;
   reg        commit_freed_reg;
 
@@ -544,6 +570,14 @@ module tinker_core (
       rf_commit_wen   <= 0;
       rf_commit_waddr <= 0;
       rf_commit_data  <= 0;
+      bp_upd_en       <= 0;
+      bp_upd_pc       <= 0;
+      bp_upd_taken    <= 0;
+      bp_upd_target   <= 0;
+      dq_ptaken0      <= 0;
+      dq_ptaken1      <= 0;
+      dq_ptgt0        <= 0;
+      dq_ptgt1        <= 0;
 
     end else begin
 
@@ -551,6 +585,7 @@ module tinker_core (
       commit_happened  = 0;
       commit_freed_reg = 0;
       redirect_en   <= 0;
+      bp_upd_en     <= 0;
       alu_en        <= 0;
       fpu_en        <= 0;
       ld_done       <= 0;
@@ -704,6 +739,10 @@ module tinker_core (
             if (lsq_v[i] && lsq_st[i] && lsq_rob[i] == ch) lsq_cmt[i] <= 1;
 
           if (rob_is_branch[ch] || rob_is_jump[ch]) begin
+            bp_upd_en     <= 1;
+            bp_upd_pc     <= rob_pc[ch];
+            bp_upd_taken  <= rob_act_taken[ch];
+            bp_upd_target <= rob_act_tgt[ch];
             if (rob_pred_taken[ch] != rob_act_taken[ch] ||
                 (rob_act_taken[ch] && rob_pred_tgt[ch] != rob_act_tgt[ch])) begin
               do_flush         = 1;
@@ -863,8 +902,8 @@ module tinker_core (
           rob_is_branch[p0_rob]  <= d0_br;
           rob_is_jump[p0_rob]    <= d0_jmp;
           rob_pc[p0_rob]         <= dq_pc0;
-          rob_pred_taken[p0_rob] <= 0;
-          rob_pred_tgt[p0_rob]   <= dq_pc0 + 64'd4;
+          rob_pred_taken[p0_rob] <= dq_ptaken0;
+          rob_pred_tgt[p0_rob]   <= dq_ptaken0 ? dq_ptgt0 : (dq_pc0 + 64'd4);
           rob_act_taken[p0_rob]  <= 0;
           rob_act_tgt[p0_rob]    <= 0;
 
@@ -992,8 +1031,8 @@ module tinker_core (
           rob_is_branch[p1_rob]  <= d1_br;
           rob_is_jump[p1_rob]    <= d1_jmp;
           rob_pc[p1_rob]         <= dq_pc1;
-          rob_pred_taken[p1_rob] <= 0;
-          rob_pred_tgt[p1_rob]   <= dq_pc1 + 64'd4;
+          rob_pred_taken[p1_rob] <= dq_ptaken1;
+          rob_pred_tgt[p1_rob]   <= dq_ptaken1 ? dq_ptgt1 : (dq_pc1 + 64'd4);
           rob_act_taken[p1_rob]  <= 0;
           rob_act_tgt[p1_rob]    <= 0;
 
@@ -1142,27 +1181,44 @@ module tinker_core (
 
       // F. FETCH / DECODE QUEUE
       if (redirect_en || call_pending || ret_pending) begin
-        dq_v0 <= 0;
-        dq_v1 <= 0;
+        dq_v0      <= 0;
+        dq_v1      <= 0;
+        dq_ptaken0 <= 0;
+        dq_ptaken1 <= 0;
         if (redirect_en) pc_reg <= redirect_pc;
       end else if (!stall && !hlt) begin
         if (d0_en && d0_ctrl) begin
           // branch/jump dispatched as d0 — rescue suppressed d1, fetch one more
-          dq_v0  <= dq_v1;
-          dq_i0  <= dq_i1;
-          dq_pc0 <= dq_pc1;
-          dq_v1  <= 1;
-          dq_i1  <= mem_i0;
-          dq_pc1 <= pc_reg;
-          pc_reg <= pc_reg + 64'd4;
+          dq_v0      <= dq_v1;
+          dq_i0      <= dq_i1;
+          dq_pc0     <= dq_pc1;
+          dq_ptaken0 <= dq_ptaken1;
+          dq_ptgt0   <= dq_ptgt1;
+          dq_v1      <= 1;
+          dq_i1      <= mem_i0;
+          dq_pc1     <= pc_reg;
+          dq_ptaken1 <= bp_pred_taken0;
+          dq_ptgt1   <= bp_pred_target0;
+          pc_reg     <= bp_pred_taken0 ? bp_pred_target0 : (pc_reg + 64'd4);
         end else begin
-          dq_v0  <= 1;
-          dq_i0  <= mem_i0;
-          dq_pc0 <= pc_reg;
-          dq_v1  <= 1;
-          dq_i1  <= mem_i1;
-          dq_pc1 <= pc_reg + 64'd4;
-          pc_reg <= pc_reg + 64'd8;
+          dq_v0      <= 1;
+          dq_i0      <= mem_i0;
+          dq_pc0     <= pc_reg;
+          dq_ptaken0 <= bp_pred_taken0;
+          dq_ptgt0   <= bp_pred_target0;
+          if (bp_pred_taken0) begin
+            // instr0 predicted taken: single-issue, redirect pc to target
+            dq_v1      <= 0;
+            dq_ptaken1 <= 0;
+            pc_reg     <= bp_pred_target0;
+          end else begin
+            dq_v1      <= 1;
+            dq_i1      <= mem_i1;
+            dq_pc1     <= pc_reg + 64'd4;
+            dq_ptaken1 <= bp_pred_taken1;
+            dq_ptgt1   <= bp_pred_target1;
+            pc_reg     <= bp_pred_taken1 ? bp_pred_target1 : (pc_reg + 64'd8);
+          end
         end
       end
 
