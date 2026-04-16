@@ -355,9 +355,8 @@ module tinker_core (
   wire [63:0] alu_act_tgt_w =
       alu_ibrimm_p1 ? (alu_pc_p1 + alu_b_p1)
     : alu_ibrreg_p1 ? (alu_pc_p1 + alu_vs_p1)
-    : alu_ibgt_p1   ? alu_ibgt_tgt_p1
-    : alu_ibr_p1    ? (alu_pc_p1 + alu_b_p1)  // FIX B: was just alu_b_p1
-    : alu_vs_p1;
+    : alu_ibgt_p1   ? alu_ibgt_tgt_p1           // FIX1: explicit flag
+  : alu_ibr_p1 ? alu_b_p1 : alu_vs_p1;
 
   wire [PHYS_W-1:0] fp_pd = fp_pd_p[2];
 
@@ -1059,7 +1058,7 @@ module tinker_core (
       if ((call_pending || ret_pending) && !redirect_en) begin
         if (rs_iss_found) rs_cnt <= rs_cnt - 1;
         if (fp_iss_found) fp_cnt <= fp_cnt - 1;
-        //if (lsq_exec) lsq_cnt <= lsq_cnt - 1;
+        if (lsq_exec) lsq_cnt <= lsq_cnt - 1;
       end
 
       // D. FU ISSUE
