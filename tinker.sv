@@ -142,7 +142,7 @@ module tinker_core (
   reg [ROB_BITS-1:0] lsq_rob[0:LSQ_SIZE-1];
   reg              lsq_isret[0:LSQ_SIZE-1]; // load result becomes PC (return)
 
-  reg [2:0] lsq_head, lsq_tail;  // 3-bit: wraps at LSQ_SIZE=8
+  reg [3:0] lsq_head, lsq_tail;
   reg [4:0] lsq_cnt;
   wire lsq_full = (lsq_cnt >= LSQ_SIZE - 2); // -2: call uses 2 LSQ slots
 
@@ -881,6 +881,11 @@ module tinker_core (
           p0_vt    = prf[p0_pt];
           p0_psrdy = prf_rdy[p0_ps];
           p0_ptrdy = prf_rdy[p0_pt];
+          // CDB bypass: if CDB fires this same cycle for p0's source, capture it now
+          if (c0en && c0pd == p0_ps) begin p0_psrdy = 1; p0_vs = c0val; end
+          if (c0en && c0pd == p0_pt) begin p0_ptrdy = 1; p0_vt = c0val; end
+          if (c1en && c1pd == p0_ps) begin p0_psrdy = 1; p0_vs = c1val; end
+          if (c1en && c1pd == p0_pt) begin p0_ptrdy = 1; p0_vt = c1val; end
           // r31 snapshot for call stack-push / return stack-load
           p0_r31_phys = rat_map[5'd31];
           p0_r31_val  = prf[p0_r31_phys];
@@ -906,7 +911,7 @@ module tinker_core (
           rt     = rt + 1;
           rc     = rc + 1;
           rob_valid[p0_rob]      <= 1;
-          rob_done[p0_rob]       <= ((!d0_wr || d0_hlt || d0_st) && !(d0_br && !d0_brgt) && !(d0_jmp && !d0_brrr && !d0_brri)) ? 1 : 0;
+          rob_done[p0_rob]       <= (!d0_wr || d0_hlt || d0_st) ? 1 : 0;
           rob_arch[p0_rob]       <= d0_rd;
           rob_phys[p0_rob]       <= p0_new;
           rob_old[p0_rob]        <= p0_old;
@@ -1008,6 +1013,17 @@ module tinker_core (
           // prf_rdy[p0_new]<=0 hasn't applied yet.  Force psrdy=0 in that case.
           p1_psrdy = (d0_en && d0_wr && d0_rd == d1_rs) ? 1'b0 : prf_rdy[p1_ps];
           p1_ptrdy = (d0_en && d0_wr && d0_rd == d1_rt) ? 1'b0 : prf_rdy[p1_pt];
+          // CDB bypass: if CDB fires this same cycle for p1's source, capture it now
+          // (but only when p1 doesn't depend on d0's fresh reg, since d0's result
+          //  isn't on the CDB yet this cycle)
+          if (!(d0_en && d0_wr && d0_rd == d1_rs)) begin
+            if (c0en && c0pd == p1_ps) begin p1_psrdy = 1; p1_vs = c0val; end
+            if (c1en && c1pd == p1_ps) begin p1_psrdy = 1; p1_vs = c1val; end
+          end
+          if (!(d0_en && d0_wr && d0_rd == d1_rt)) begin
+            if (c0en && c0pd == p1_pt) begin p1_ptrdy = 1; p1_vt = c0val; end
+            if (c1en && c1pd == p1_pt) begin p1_ptrdy = 1; p1_vt = c1val; end
+          end
           p1_r31_phys = rat_map[5'd31];
           p1_r31_val  = prf[p1_r31_phys];
           p1_r31_rdy  = prf_rdy[p1_r31_phys];
@@ -1028,7 +1044,7 @@ module tinker_core (
           rt     = rt + 1;
           rc     = rc + 1;
           rob_valid[p1_rob]      <= 1;
-          rob_done[p1_rob]       <= ((!d1_wr || d1_hlt || d1_st) && !(d1_br && !d1_brgt) && !(d1_jmp && !d1_brrr && !d1_brri)) ? 1 : 0;
+          rob_done[p1_rob]       <= (!d1_wr || d1_hlt || d1_st) ? 1 : 0;
           rob_arch[p1_rob]       <= d1_rd;
           rob_phys[p1_rob]       <= p1_new;
           rob_old[p1_rob]        <= p1_old;
