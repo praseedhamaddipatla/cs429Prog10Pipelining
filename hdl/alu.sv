@@ -1,5 +1,6 @@
-// alu.sv — pipelined alu
-// int ops : 1-cycle latency
+// alu.sv — pipelined alu + fpu
+// int ops : 1-cycle latency (alu_int)
+// fp ops  : 3-cycle latency (fpu_addsub / fpu_mul / fpu_div)
 
 module alu (
     input         clk,
@@ -13,6 +14,7 @@ module alu (
     output reg [63:0] result,
     output reg [5:0]  rob_tag_out
 );
+    // op codes
     localparam ADD   = 5'd0,  SUB   = 5'd1,  MUL  = 5'd2,  DIV  = 5'd3;
     localparam AND   = 5'd4,  OR    = 5'd5,  XOR  = 5'd6,  NOT  = 5'd7;
     localparam SHR   = 5'd8,  SHL   = 5'd9;
@@ -37,6 +39,7 @@ module alu (
         endcase
     end
 
+    // register output — 1 cycle latency
     always @(posedge clk) begin
         if (reset) begin
             valid_out <= 0; result <= 0; rob_tag_out <= 0;

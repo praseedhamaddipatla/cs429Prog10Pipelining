@@ -1,15 +1,17 @@
-// decoder.sv — instruction decode
-// Yosys-compatible (localparams without types, integer loop vars)
+// decoder.sv — instruction decode (FIXED)
+// Fixes:
+//  - call: waddr=rd (not r31); raddr2=r31 so dispatch can access SP for stack store
+//  - return: raddr1=r31 so dispatch has SP value for stack load
 
 module decoder (
     input      [31:0] instr,
-    output reg [ 4:0] raddr1,
-    output reg [ 4:0] raddr2,
-    output reg [ 4:0] waddr,
+    output reg [ 4:0] raddr1,      // arch src reg a
+    output reg [ 4:0] raddr2,      // arch src reg b  (also r31 for call)
+    output reg [ 4:0] waddr,       // arch dest reg
     output reg [63:0] immediate,
-    output reg [ 4:0] op,
-    output reg        use_imm,
-    output reg        write,
+    output reg [ 4:0] op,          // alu/fpu op code
+    output reg        use_imm,     // b operand = imm
+    output reg        write,       // instr writes a reg
     output reg        is_load,
     output reg        is_store,
     output reg        is_branch,
@@ -22,8 +24,9 @@ module decoder (
     output reg        is_halt,
     output reg        is_mov_reg,
     output reg        is_mov_imm,
-    output reg [ 4:0] rt_addr
+    output reg [ 4:0] rt_addr      // third src for brgt
 );
+
   wire [ 4:0] opcode = instr[31:27];
   wire [ 4:0] rd = instr[26:22];
   wire [ 4:0] rs = instr[21:17];
@@ -33,33 +36,47 @@ module decoder (
   wire [63:0] imm_signed = {{52{imm12[11]}}, imm12};
   wire [63:0] imm_unsigned = {52'd0, imm12};
 
-  localparam ADD = 5'd0, SUB = 5'd1, MUL = 5'd2, DIV = 5'd3;
-  localparam AND = 5'd4, OR = 5'd5, XOR = 5'd6, NOT = 5'd7;
-  localparam SHR = 5'd8, SHL = 5'd9;
-  localparam ADDF = 5'd10, SUBF = 5'd11, MULF = 5'd12, DIVF = 5'd13;
-  localparam CMPNZ = 5'd14, CMPGT = 5'd15;
+  // alu op codes
+  localparam ADD = 5'd0;
+  localparam SUB = 5'd1;
+  localparam MUL = 5'd2;
+  localparam DIV = 5'd3;
+  localparam AND = 5'd4;
+  localparam OR = 5'd5;
+  localparam XOR = 5'd6;
+  localparam NOT = 5'd7;
+  localparam SHR = 5'd8;
+  localparam SHL = 5'd9;
+  localparam ADDF = 5'd10;
+  localparam SUBF = 5'd11;
+  localparam MULF = 5'd12;
+  localparam DIVF = 5'd13;
+  localparam CMPNZ = 5'd14;
+  localparam CMPGT = 5'd15;
 
   always @(*) begin
-    raddr1 = 5'd0;
-    raddr2 = 5'd0;
-    waddr = 5'd0;
-    rt_addr = 5'd0;
-    immediate = 64'd0;
-    op = ADD;
-    use_imm = 0;
-    write = 0;
-    is_load = 0;
-    is_store = 0;
-    is_branch = 0;
-    is_brgt = 0;
-    is_jump = 0;
+    // defaults — nop
+    raddr1     = 5'd0;
+    raddr2     = 5'd0;
+    waddr      = 5'd0;
+    rt_addr    = 5'd0;
+    immediate  = 64'd0;
+    op         = ADD;
+    use_imm    = 0;
+    write      = 0;
+    is_load    = 0;
+    is_store   = 0;
+    is_branch  = 0;
+    is_brgt    = 0;
+    is_jump    = 0;
     is_brr_reg = 0;
     is_brr_imm = 0;
-    is_return = 0;
-    is_call = 0;
-    is_halt = 0;
+    is_return  = 0;
+    is_call    = 0;
+    is_halt    = 0;
     is_mov_reg = 0;
     is_mov_imm = 0;
+
     case (opcode)
       5'h00: begin
         raddr1 = rs;
@@ -265,4 +282,5 @@ module decoder (
       end
     endcase
   end
+
 endmodule
