@@ -331,6 +331,69 @@ module diag_tb;
     $display(""); endtask
 
   // ===========================================================
+  // WIN-1: many independent addi into r20-r27 (OOO window test)
+  // ===========================================================
+  function [31:0] f_mov_reg; input [4:0] rd,rs; f_mov_reg={5'h11,rd,rs,17'd0}; endfunction
+  task t_win1; $display("WIN-1: independent addi r20-r27"); clear_mem;
+    // addi r20,1 .. addi r27,8 then halt
+    load_w(64'h2000,f_addi(5'd20,12'd1));
+    load_w(64'h2004,f_addi(5'd21,12'd2));
+    load_w(64'h2008,f_addi(5'd22,12'd3));
+    load_w(64'h200C,f_addi(5'd23,12'd4));
+    load_w(64'h2010,f_addi(5'd24,12'd5));
+    load_w(64'h2014,f_addi(5'd25,12'd6));
+    load_w(64'h2018,f_addi(5'd26,12'd7));
+    load_w(64'h201C,f_addi(5'd27,12'd8));
+    load_w(64'h2020,f_halt());
+    run(200);
+    if(g_to) begin $display("    TIMEOUT"); fail_n=fail_n+1; dump_basic; dump_rob_head; dump_rs_all; end
+    else begin
+      $display("    halted in %0d cycles",g_cyc);
+      chk("r20(=1)",dut.reg_file.registers[20],64'd1);
+      chk("r21(=2)",dut.reg_file.registers[21],64'd2);
+      chk("r22(=3)",dut.reg_file.registers[22],64'd3);
+      chk("r23(=4)",dut.reg_file.registers[23],64'd4);
+      chk("r24(=5)",dut.reg_file.registers[24],64'd5);
+      chk("r25(=6)",dut.reg_file.registers[25],64'd6);
+      chk("r26(=7)",dut.reg_file.registers[26],64'd7);
+      chk("r27(=8)",dut.reg_file.registers[27],64'd8);
+    end
+    $display(""); endtask
+
+  // ===========================================================
+  // WIN-2: deep dependency chain filling ROB (>8 instructions)
+  // ===========================================================
+  task t_win2; $display("WIN-2: 16-instr chain with dep + loop"); clear_mem;
+    // r1=1, r2=2,...,r8=8 then add r20=r1+r2, r21=r3+r4, r22=r5+r6, r23=r7+r8
+    // r24=r20+r21, r25=r22+r23, r26=r24+r25
+    load_w(64'h2000,f_addi(5'd1,12'd1));
+    load_w(64'h2004,f_addi(5'd2,12'd2));
+    load_w(64'h2008,f_addi(5'd3,12'd3));
+    load_w(64'h200C,f_addi(5'd4,12'd4));
+    load_w(64'h2010,f_addi(5'd5,12'd5));
+    load_w(64'h2014,f_addi(5'd6,12'd6));
+    load_w(64'h2018,f_addi(5'd7,12'd7));
+    load_w(64'h201C,f_addi(5'd8,12'd8));
+    load_w(64'h2020,f_add3(5'd20,5'd1,5'd2));  // r20 = 3
+    load_w(64'h2024,f_add3(5'd21,5'd3,5'd4));  // r21 = 7
+    load_w(64'h2028,f_add3(5'd22,5'd5,5'd6));  // r22 = 11
+    load_w(64'h202C,f_add3(5'd23,5'd7,5'd8));  // r23 = 15
+    load_w(64'h2030,f_add3(5'd24,5'd20,5'd21)); // r24 = 10
+    load_w(64'h2034,f_add3(5'd25,5'd22,5'd23)); // r25 = 26
+    load_w(64'h2038,f_add3(5'd26,5'd24,5'd25)); // r26 = 36
+    load_w(64'h203C,f_halt());
+    run(500);
+    if(g_to) begin $display("    TIMEOUT"); fail_n=fail_n+1; dump_basic; dump_rob_head; dump_rs_all; end
+    else begin
+      $display("    halted in %0d cycles",g_cyc);
+      chk("r20(=3)",dut.reg_file.registers[20],64'd3);
+      chk("r21(=7)",dut.reg_file.registers[21],64'd7);
+      chk("r24(=10)",dut.reg_file.registers[24],64'd10);
+      chk("r26(=36)",dut.reg_file.registers[26],64'd36);
+    end
+    $display(""); endtask
+
+  // ===========================================================
   // MAIN
   // ===========================================================
   initial begin
@@ -345,6 +408,8 @@ module diag_tb;
     t_br1; t_br2; t_brnz1; t_brnz_br;
     $display("--- MEMORY TESTS ---");
     t_mem1; t_mem2; t_mem3;
+    $display("--- WINDOW TESTS ---");
+    t_win1; t_win2;
     $display("================================================================");
     $display("  PASS: %0d    FAIL: %0d    TOTAL: %0d",pass_n,fail_n,pass_n+fail_n);
     $display("================================================================");

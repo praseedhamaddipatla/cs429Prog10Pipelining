@@ -85,6 +85,8 @@ module tinker_core (
   reg                 rs_iret                              [  0:RS_INT-1];
   reg                 rs_ptaken                            [  0:RS_INT-1];
   reg  [        63:0] rs_ptgt                              [  0:RS_INT-1];
+  reg  [  PHYS_W-1:0] rs_pt3                               [  0:RS_INT-1];
+  reg                 rs_pt3rdy                            [  0:RS_INT-1];
 
   reg  [         3:0] rs_cnt;
   wire                rs_full = (rs_cnt >= RS_INT - 1);
@@ -417,7 +419,8 @@ module tinker_core (
     rs_iss_idx   = 0;
     rs_iss_found = 0;
     for (i = 0; i < RS_INT; i = i + 1)
-    if (!rs_iss_found && rs_v[i] && rs_psrdy[i] && (rs_uimm[i] || rs_ptrdy[i])) begin
+    if (!rs_iss_found && rs_v[i] && rs_psrdy[i] && (rs_uimm[i] || rs_ptrdy[i]) &&
+        (!rs_ibgt[i] || rs_pt3rdy[i])) begin
       rs_iss_idx   = i;
       rs_iss_found = 1;
     end
@@ -594,6 +597,10 @@ module tinker_core (
             rs_ptrdy[i] <= 1;
             rs_vt[i] <= c0val;
           end
+          if (rs_ibgt[i] && !rs_pt3rdy[i] && rs_pt3[i] == c0pd) begin
+            rs_pt3rdy[i] <= 1;
+            rs_imm[i]    <= c0val;
+          end
         end
         for (i = 0; i < RS_FP; i = i + 1)
         if (fp_v[i]) begin
@@ -637,6 +644,10 @@ module tinker_core (
           if (!rs_ptrdy[i] && rs_pt[i] == c1pd) begin
             rs_ptrdy[i] <= 1;
             rs_vt[i] <= c1val;
+          end
+          if (rs_ibgt[i] && !rs_pt3rdy[i] && rs_pt3[i] == c1pd) begin
+            rs_pt3rdy[i] <= 1;
+            rs_imm[i]    <= c1val;
           end
         end
         for (i = 0; i < RS_FP; i = i + 1)
@@ -904,7 +915,9 @@ module tinker_core (
             rs_vs[rs_free_slot]     <= p0_vs;
             rs_vt[rs_free_slot]     <= p0_vt;
             rs_imm[rs_free_slot]    <= d0_brgt ? prf[rat_map[d0_rtx]] : d0_imm;
-            rs_uimm[rs_free_slot]   <= d0_uimm;
+            rs_uimm[rs_free_slot]   <= d0_uimm || d0_brri;
+            rs_pt3[rs_free_slot]    <= d0_brgt ? rat_map[d0_rtx] : 6'd0;
+            rs_pt3rdy[rs_free_slot] <= d0_brgt ? prf_rdy[rat_map[d0_rtx]] : 1'b1;
             rs_rob[rs_free_slot]    <= p0_rob;
             rs_pc[rs_free_slot]     <= dq_pc0;
             rs_ibr[rs_free_slot]    <= d0_br;
@@ -1027,7 +1040,9 @@ module tinker_core (
               rs_vs[rslot]     <= p1_vs;
               rs_vt[rslot]     <= p1_vt;
               rs_imm[rslot]    <= d1_brgt ? prf[rat_map[d1_rtx]] : d1_imm;
-              rs_uimm[rslot]   <= d1_uimm;
+              rs_uimm[rslot]   <= d1_uimm || d1_brri;
+              rs_pt3[rslot]    <= d1_brgt ? rat_map[d1_rtx] : 6'd0;
+              rs_pt3rdy[rslot] <= d1_brgt ? prf_rdy[rat_map[d1_rtx]] : 1'b1;
               rs_rob[rslot]    <= p1_rob;
               rs_pc[rslot]     <= dq_pc1;
               rs_ibr[rslot]    <= d1_br;
