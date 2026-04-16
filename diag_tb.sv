@@ -25,6 +25,8 @@ module diag_tb;
   function [31:0] f_shftli; input [4:0] rd; input [11:0] imm; f_shftli={5'h07,rd,10'd0,imm}; endfunction
   function [31:0] f_br;     input [4:0] rd;                   f_br    ={5'h08,rd,22'd0}; endfunction
   function [31:0] f_brnz;   input [4:0] rd,rs;                f_brnz  ={5'h0B,rd,rs,17'd0}; endfunction
+  function [31:0] f_brgt;   input [4:0] rd,rs,rt;             f_brgt  ={5'h0E,rd,rs,rt,12'd0}; endfunction
+  function [31:0] f_sub3;   input [4:0] rd,rs,rt;             f_sub3  ={5'h1A,rd,rs,rt,12'd0}; endfunction
   function [31:0] f_load;   input [4:0] rd,rs; input [11:0] imm; f_load={5'h10,rd,rs,5'd0,imm}; endfunction
   function [31:0] f_store;  input [4:0] rd,rs; input [11:0] imm; f_store={5'h13,rd,rs,5'd0,imm}; endfunction
   function [31:0] f_halt;   f_halt=32'h7800_0000; endfunction
@@ -394,6 +396,93 @@ module diag_tb;
     $display(""); endtask
 
   // ===========================================================
+  // BRGT-1: brgt taken (r1=5 > r2=3, jump to 0x2020)
+  // ===========================================================
+  task t_brgt1; $display("BRGT-1: brgt taken (r1=5>r2=3, jump to halt)"); clear_mem;
+    // r1=5
+    load_w(64'h2000,f_addi(5'd1,12'd5));
+    // r2=3
+    load_w(64'h2004,f_addi(5'd2,12'd3));
+    // r3 = 0x2020 (target): addi r3,514; shftli r3,4
+    load_w(64'h2008,f_addi(5'd3,12'd514));
+    load_w(64'h200C,f_shftli(5'd3,12'd4));
+    // brgt r3, r1, r2 (branch to r3 if r1>r2)
+    load_w(64'h2010,f_brgt(5'd3,5'd1,5'd2));
+    // not-taken path: addi r5,99
+    load_w(64'h2014,f_addi(5'd5,12'd99));
+    load_w(64'h2018,f_halt()); // dead end (not reached if taken)
+    // taken path at 0x2020: halt
+    load_w(64'h2020,f_halt());
+    run(200);
+    if(g_to) begin $display("    TIMEOUT"); fail_n=fail_n+1; dump_basic; dump_rob_head; dump_rs_all; end
+    else begin
+      $display("    halted in %0d cycles",g_cyc);
+      chk("r5(=0,not-taken-path-skipped)",dut.reg_file.registers[5],64'd0);
+    end
+    $display(""); endtask
+
+  // BRGT-2: brgt not-taken (r1=3 < r2=5, fall through)
+  task t_brgt2; $display("BRGT-2: brgt not-taken (r1=3<r2=5, fallthrough)"); clear_mem;
+    load_w(64'h2000,f_addi(5'd1,12'd3));
+    load_w(64'h2004,f_addi(5'd2,12'd5));
+    load_w(64'h2008,f_addi(5'd3,12'd514));
+    load_w(64'h200C,f_shftli(5'd3,12'd4)); // r3=0x2020
+    load_w(64'h2010,f_brgt(5'd3,5'd1,5'd2));
+    // not-taken: fall through
+    load_w(64'h2014,f_addi(5'd5,12'd77));
+    load_w(64'h2018,f_halt());
+    load_w(64'h2020,f_halt()); // in case taken (wrong)
+    run(200);
+    if(g_to) begin $display("    TIMEOUT"); fail_n=fail_n+1; dump_basic; dump_rob_head; dump_rs_all; end
+    else begin
+      $display("    halted in %0d cycles",g_cyc);
+      chk("r5(=77,fallthrough)",dut.reg_file.registers[5],64'd77);
+    end
+    $display(""); endtask
+
+  // ===========================================================
+  // MEM-4: 16 sequential loads from base address (r0=65536)
+  // ===========================================================
+  task t_mem4; integer k; $display("MEM-4: 16 sequential loads into r8-r23"); clear_mem;
+    // preload data: m[65536+8k] = k+1 for k=0..15
+    for (k=0;k<16;k=k+1) load_d(64'd65536 + k*8, k+1);
+    // set r1=65536 via addi r1,1; shftli r1,16
+    load_w(64'h2000,f_addi(5'd1,12'd1));
+    load_w(64'h2004,f_shftli(5'd1,12'd16));
+    // loads r8-r23 from (r1)(0..120)
+    load_w(64'h2008,f_load(5'd8, 5'd1, 12'd0));
+    load_w(64'h200C,f_load(5'd9, 5'd1, 12'd8));
+    load_w(64'h2010,f_load(5'd10,5'd1, 12'd16));
+    load_w(64'h2014,f_load(5'd11,5'd1, 12'd24));
+    load_w(64'h2018,f_load(5'd12,5'd1, 12'd32));
+    load_w(64'h201C,f_load(5'd13,5'd1, 12'd40));
+    load_w(64'h2020,f_load(5'd14,5'd1, 12'd48));
+    load_w(64'h2024,f_load(5'd15,5'd1, 12'd56));
+    load_w(64'h2028,f_load(5'd16,5'd1, 12'd64));
+    load_w(64'h202C,f_load(5'd17,5'd1, 12'd72));
+    load_w(64'h2030,f_load(5'd18,5'd1, 12'd80));
+    load_w(64'h2034,f_load(5'd19,5'd1, 12'd88));
+    load_w(64'h2038,f_load(5'd20,5'd1, 12'd96));
+    load_w(64'h203C,f_load(5'd21,5'd1, 12'd104));
+    load_w(64'h2040,f_load(5'd22,5'd1, 12'd112));
+    load_w(64'h2044,f_load(5'd23,5'd1, 12'd120));
+    load_w(64'h2048,f_halt());
+    run(500);
+    if(g_to) begin $display("    TIMEOUT"); fail_n=fail_n+1; dump_basic; dump_rob_head; dump_rs_all; dump_lsq_all; end
+    else begin
+      $display("    halted in %0d cycles",g_cyc);
+      chk("r8(=1)",  dut.reg_file.registers[8],  64'd1);
+      chk("r9(=2)",  dut.reg_file.registers[9],  64'd2);
+      chk("r12(=5)", dut.reg_file.registers[12], 64'd5);
+      chk("r15(=8)", dut.reg_file.registers[15], 64'd8);
+      chk("r16(=9)", dut.reg_file.registers[16], 64'd9);
+      chk("r19(=12)",dut.reg_file.registers[19], 64'd12);
+      chk("r20(=13)",dut.reg_file.registers[20], 64'd13);
+      chk("r23(=16)",dut.reg_file.registers[23], 64'd16);
+    end
+    $display(""); endtask
+
+  // ===========================================================
   // MAIN
   // ===========================================================
   initial begin
@@ -406,8 +495,10 @@ module diag_tb;
     t_sanity;
     $display("--- BRANCH TESTS ---");
     t_br1; t_br2; t_brnz1; t_brnz_br;
+    $display("--- BRGT TESTS ---");
+    t_brgt1; t_brgt2;
     $display("--- MEMORY TESTS ---");
-    t_mem1; t_mem2; t_mem3;
+    t_mem1; t_mem2; t_mem3; t_mem4;
     $display("--- WINDOW TESTS ---");
     t_win1; t_win2;
     $display("================================================================");
