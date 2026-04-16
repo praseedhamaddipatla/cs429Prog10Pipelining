@@ -1,3 +1,4 @@
+
 // tinker.sv — tinker cpu core (ooo, dual-issue)
 // optimizations: forwarding, multi-issue, ooo, pipelined fu, ls queue,
 //   deeper pipeline, branch prediction, register renaming
@@ -142,7 +143,7 @@ module tinker_core (
   reg [ROB_BITS-1:0] lsq_rob[0:LSQ_SIZE-1];
   reg              lsq_isret[0:LSQ_SIZE-1]; // load result becomes PC (return)
 
-  reg [2:0] lsq_head, lsq_tail;  // 3-bit: wraps at LSQ_SIZE=8
+  reg [3:0] lsq_head, lsq_tail;
   reg [4:0] lsq_cnt;
   wire lsq_full = (lsq_cnt >= LSQ_SIZE - 2); // -2: call uses 2 LSQ slots
 
@@ -697,8 +698,6 @@ module tinker_core (
         end
       end
 
-      // Trace load completions for memory debugging
-      if (c1en && !rob_valid[c1rob])
       if (c1en && rob_valid[c1rob]) begin
         prf[c1pd]         <= c1val;
         prf_rdy[c1pd]     <= 1;
@@ -906,7 +905,7 @@ module tinker_core (
           rt     = rt + 1;
           rc     = rc + 1;
           rob_valid[p0_rob]      <= 1;
-          rob_done[p0_rob]       <= (!d0_wr || d0_hlt || d0_st) && !d0_br && !d0_jmp ? 1 : 0;
+          rob_done[p0_rob]       <= (!d0_wr || d0_hlt || d0_st) ? 1 : 0;
           rob_arch[p0_rob]       <= d0_rd;
           rob_phys[p0_rob]       <= p0_new;
           rob_old[p0_rob]        <= p0_old;
@@ -1028,7 +1027,7 @@ module tinker_core (
           rt     = rt + 1;
           rc     = rc + 1;
           rob_valid[p1_rob]      <= 1;
-          rob_done[p1_rob]       <= (!d1_wr || d1_hlt || d1_st) && !d1_br && !d1_jmp ? 1 : 0;
+          rob_done[p1_rob]       <= (!d1_wr || d1_hlt || d1_st) ? 1 : 0;
           rob_arch[p1_rob]       <= d1_rd;
           rob_phys[p1_rob]       <= p1_new;
           rob_old[p1_rob]        <= p1_old;
