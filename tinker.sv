@@ -824,6 +824,15 @@ module tinker_core (
           p0_vt    = prf[p0_pt];
           p0_psrdy = prf_rdy[p0_ps];
           p0_ptrdy = prf_rdy[p0_pt];
+          // same-cycle CDB forwarding: CDB fires this cycle but prf_rdy not yet updated
+          if (c0en) begin
+            if (!p0_psrdy && p0_ps == c0pd) begin p0_psrdy = 1; p0_vs = c0val; end
+            if (!p0_ptrdy && p0_pt == c0pd) begin p0_ptrdy = 1; p0_vt = c0val; end
+          end
+          if (c1en) begin
+            if (!p0_psrdy && p0_ps == c1pd) begin p0_psrdy = 1; p0_vs = c1val; end
+            if (!p0_ptrdy && p0_pt == c1pd) begin p0_ptrdy = 1; p0_vt = c1val; end
+          end
           p0_r31_phys = rat_map[5'd31];
           p0_r31_val  = prf[p0_r31_phys];
           p0_r31_rdy  = prf_rdy[p0_r31_phys];
@@ -942,6 +951,15 @@ module tinker_core (
           p1_vt    = prf[p1_pt];
           p1_psrdy = (d0_en && d0_wr && d0_rd == d1_rs) ? 1'b0 : prf_rdy[p1_ps];
           p1_ptrdy = (d0_en && d0_wr && d0_rd == d1_rt) ? 1'b0 : prf_rdy[p1_pt];
+          // same-cycle CDB forwarding for d1 (skip if d0 just renamed the reg)
+          if (c0en) begin
+            if (!p1_psrdy && !(d0_en && d0_wr && d0_rd == d1_rs) && p1_ps == c0pd) begin p1_psrdy = 1; p1_vs = c0val; end
+            if (!p1_ptrdy && !(d0_en && d0_wr && d0_rd == d1_rt) && p1_pt == c0pd) begin p1_ptrdy = 1; p1_vt = c0val; end
+          end
+          if (c1en) begin
+            if (!p1_psrdy && !(d0_en && d0_wr && d0_rd == d1_rs) && p1_ps == c1pd) begin p1_psrdy = 1; p1_vs = c1val; end
+            if (!p1_ptrdy && !(d0_en && d0_wr && d0_rd == d1_rt) && p1_pt == c1pd) begin p1_ptrdy = 1; p1_vt = c1val; end
+          end
           p1_r31_phys = rat_map[5'd31];
           p1_r31_val  = prf[p1_r31_phys];
           p1_r31_rdy  = prf_rdy[p1_r31_phys];
