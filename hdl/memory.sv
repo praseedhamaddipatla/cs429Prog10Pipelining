@@ -13,17 +13,25 @@ module memory #(
 ) (
     input         clk,
 
-    // instr fetch ports (2 for dual-issue)
+    // instr fetch ports (4 for quad-issue / 64-byte fetch)
     input  [63:0] fetch_addr0,
     input  [63:0] fetch_addr1,
+    input  [63:0] fetch_addr2,
+    input  [63:0] fetch_addr3,
     output [31:0] instr_out0,
     output [31:0] instr_out1,
+    output [31:0] instr_out2,
+    output [31:0] instr_out3,
 
-    // data port
+    // data port 0 (load/store)
     input  [63:0] data_addr,
     input  [63:0] write_data,
     input         we,
-    output [63:0] read_data
+    output [63:0] read_data,
+
+    // data port 1 (second load)
+    input  [63:0] data_addr2,
+    output [63:0] read_data2
 );
 
     reg [7:0] bytes [0:MEM_SIZE-1];
@@ -33,12 +41,22 @@ module memory #(
                          bytes[fetch_addr0+1], bytes[fetch_addr0]};
     assign instr_out1 = {bytes[fetch_addr1+3], bytes[fetch_addr1+2],
                          bytes[fetch_addr1+1], bytes[fetch_addr1]};
+    assign instr_out2 = {bytes[fetch_addr2+3], bytes[fetch_addr2+2],
+                         bytes[fetch_addr2+1], bytes[fetch_addr2]};
+    assign instr_out3 = {bytes[fetch_addr3+3], bytes[fetch_addr3+2],
+                         bytes[fetch_addr3+1], bytes[fetch_addr3]};
 
-    // data load — little-endian 64-bit
+    // data load port 0 — little-endian 64-bit
     assign read_data = {bytes[data_addr+7], bytes[data_addr+6],
                         bytes[data_addr+5], bytes[data_addr+4],
                         bytes[data_addr+3], bytes[data_addr+2],
                         bytes[data_addr+1], bytes[data_addr]};
+
+    // data load port 1 — little-endian 64-bit
+    assign read_data2 = {bytes[data_addr2+7], bytes[data_addr2+6],
+                         bytes[data_addr2+5], bytes[data_addr2+4],
+                         bytes[data_addr2+3], bytes[data_addr2+2],
+                         bytes[data_addr2+1], bytes[data_addr2]};
 
     // store (committed by rob)
     always @(posedge clk) begin
