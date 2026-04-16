@@ -475,6 +475,7 @@ module tinker_core (
   reg [63:0] call_wdata;
   reg        ret_pending;
   reg [63:0] ret_addr;
+  reg [ROB_BITS-1:0] ret_rob_tag;  // ROB tag of the in-flight return instruction
 
   // ---------------------------------------------------------------------------
   // FREE-SLOT COMBINATIONAL LOGIC
@@ -627,6 +628,7 @@ module tinker_core (
       rf_commit_data  <= 0;
       call_pending    <= 0;
       ret_pending     <= 0;
+      ret_rob_tag     <= 0;
 
     end else begin
 
@@ -654,6 +656,14 @@ module tinker_core (
         redirect_en <= 1;
         redirect_pc <= lsq_mrdata;
         ret_pending <= 0;
+        // The return's ROB entry is the one that issued most recently with iret=1.
+        // We stored its rob tag in a register when we deferred rob_done.
+        // Set it done now with the actual target.
+        if (rob_valid[ret_rob_tag]) begin
+          rob_done[ret_rob_tag]     <= 1;
+          rob_act_taken[ret_rob_tag] <= 1;
+          rob_act_tgt[ret_rob_tag]   <= lsq_mrdata;
+        end
       end
 
       // ================================================================
@@ -676,9 +686,28 @@ module tinker_core (
         prf_rdy[c0pd]     <= 1;
         rob_done[c0rob]   <= 1;
         rob_result[c0rob] <= c0val;
+        // All branches and jumps: record actual outcome
         if (alu_ibr_p1 || alu_ijmp_p1) begin
           rob_act_taken[c0rob] <= alu_act_taken_w;
           rob_act_tgt[c0rob]   <= alu_act_tgt_w;
+        end
+        // call: trigger memory write (stack push: mem[r31-8] = pc+4)
+        // alu_b holds the r31 value (decoder sets raddr2=r31 for call).
+        // call_tgt is the jump destination = alu_vs_p1 (raddr1=rd = jump target).
+        if (alu_ical_p1) begin
+          call_pending <= 1;
+          call_tgt     <= alu_vs_p1;          // jump target (rd value)
+          call_addr    <= alu_b_p1 - 64'd8;   // r31 value - 8
+          call_wdata   <= c0val;              // pc+4 (return address)
+        end
+        // return: trigger memory read (stack load: pc = mem[r31-8])
+        // alu_vs_p1 = r31 value (raddr1=r31 from decoder).
+        if (alu_iret_p1) begin
+          ret_pending  <= 1;
+          ret_addr     <= alu_vs_p1 - 64'd8;
+          ret_rob_tag  <= c0rob;
+          // Don't set rob_done yet for return — we need the memory result.
+          rob_done[c0rob] <= 0;
         end
         for (i = 0; i < RS_INT; i = i + 1)
         if (rs_v[i]) begin
@@ -1023,7 +1052,14 @@ module tinker_core (
             rc     = rc + 1;
 
             rob_valid[p0_rob]    <= 1;
-            rob_done[p0_rob]     <= (!d0_wr || d0_hlt || d0_st) ? 1 : 0;
+            // rob_done rules:
+            //   - halt: done immediately (no result needed)
+            //   - store: done immediately (result written to mem, not reg)
+            //   - branch/jump: NOT done until ALU writes act_taken/act_tgt
+            //   - instruction with dest reg: NOT done until FU writes result
+            //   - nop (no wr, no br/jmp, no mem): done immediately
+            rob_done[p0_rob]     <= (d0_hlt || d0_st ||
+                                     (!d0_wr && !d0_br && !(d0_jmp||d0_call||d0_ret))) ? 1 : 0;
             rob_arch[p0_rob]     <= d0_rd;
             rob_phys[p0_rob]     <= p0_new;
             rob_old[p0_rob]      <= p0_old;
@@ -1036,11 +1072,6 @@ module tinker_core (
             rob_act_taken[p0_rob]  <= 0;
             rob_act_tgt[p0_rob]    <= 0;
 
-            // -------------------------------------------------------
-            // FIX: Set rob_is_branch and rob_is_jump at dispatch.
-            // Previously these were never written, so commit never
-            // detected mispredictions — loops ran forever.
-            // -------------------------------------------------------
             rob_is_branch[p0_rob] <= d0_br;
             rob_is_jump[p0_rob]   <= d0_jmp || d0_call || d0_ret;
 
@@ -1153,7 +1184,8 @@ module tinker_core (
             rc     = rc + 1;
 
             rob_valid[p1_rob]    <= 1;
-            rob_done[p1_rob]     <= (!d1_wr || d1_hlt || d1_st) ? 1 : 0;
+            rob_done[p1_rob]     <= (d1_hlt || d1_st ||
+                                     (!d1_wr && !d1_br && !(d1_jmp||d1_call||d1_ret))) ? 1 : 0;
             rob_arch[p1_rob]     <= d1_rd;
             rob_phys[p1_rob]     <= p1_new;
             rob_old[p1_rob]      <= p1_old;
@@ -1166,7 +1198,6 @@ module tinker_core (
             rob_act_taken[p1_rob]  <= 0;
             rob_act_tgt[p1_rob]    <= 0;
 
-            // FIX: Set rob_is_branch / rob_is_jump for d1 as well
             rob_is_branch[p1_rob] <= d1_br;
             rob_is_jump[p1_rob]   <= d1_jmp || d1_call || d1_ret;
 
