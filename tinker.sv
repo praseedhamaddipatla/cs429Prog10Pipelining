@@ -518,10 +518,22 @@ module tinker_core (
   reg [ROB_BITS-1:0] ld_rtag;
   reg ld_isret;
 
-  wire c1en = ld_done || fpu_vout;
-  wire [PHYS_W-1:0] c1pd = ld_done ? ld_pd : fp_pd;
-  wire [63:0] c1val = ld_done ? ld_val : fpu_res;
-  wire [ROB_BITS-1:0] c1rob = ld_done ? ld_rtag : fpu_tout[ROB_BITS-1:0];
+  // FPU0 stash: holds FPU result when ld_done and fpu_vout collide on CDB1
+  reg        fpu_stash_v;
+  reg [PHYS_W-1:0]   fpu_stash_pd;
+  reg [63:0]         fpu_stash_val;
+  reg [ROB_BITS-1:0] fpu_stash_rob;
+
+  // CDB1 picks: load > stashed FPU > fresh FPU
+  wire c1_fpu_src = fpu_stash_v | fpu_vout;
+  wire [PHYS_W-1:0]   c1_fpu_pd  = fpu_stash_v ? fpu_stash_pd  : fp_pd;
+  wire [63:0]         c1_fpu_val = fpu_stash_v ? fpu_stash_val : fpu_res;
+  wire [ROB_BITS-1:0] c1_fpu_rob = fpu_stash_v ? fpu_stash_rob : fpu_tout[ROB_BITS-1:0];
+
+  wire c1en = ld_done || c1_fpu_src;
+  wire [PHYS_W-1:0] c1pd = ld_done ? ld_pd  : c1_fpu_pd;
+  wire [63:0] c1val       = ld_done ? ld_val : c1_fpu_val;
+  wire [ROB_BITS-1:0] c1rob = ld_done ? ld_rtag : c1_fpu_rob;
 
   // ─────────────────── CDB3 = LD1 or FPU1 ───────────────────
   wire [PHYS_W-1:0] fp1_pd = fp1_pd_p[2];
@@ -532,10 +544,21 @@ module tinker_core (
   reg [ROB_BITS-1:0] ld1_rtag;
   reg ld1_isret;
 
-  wire c3en = ld1_done || fpu1_vout;
-  wire [PHYS_W-1:0] c3pd = ld1_done ? ld1_pd : fp1_pd;
-  wire [63:0] c3val = ld1_done ? ld1_val : fpu1_res;
-  wire [ROB_BITS-1:0] c3rob = ld1_done ? ld1_rtag : fpu1_tout[ROB_BITS-1:0];
+  // FPU1 stash: holds FPU1 result when ld1_done and fpu1_vout collide on CDB3
+  reg        fpu1_stash_v;
+  reg [PHYS_W-1:0]   fpu1_stash_pd;
+  reg [63:0]         fpu1_stash_val;
+  reg [ROB_BITS-1:0] fpu1_stash_rob;
+
+  wire c3_fpu_src = fpu1_stash_v | fpu1_vout;
+  wire [PHYS_W-1:0]   c3_fpu_pd  = fpu1_stash_v ? fpu1_stash_pd  : fp1_pd;
+  wire [63:0]         c3_fpu_val = fpu1_stash_v ? fpu1_stash_val : fpu1_res;
+  wire [ROB_BITS-1:0] c3_fpu_rob = fpu1_stash_v ? fpu1_stash_rob : fpu1_tout[ROB_BITS-1:0];
+
+  wire c3en = ld1_done || c3_fpu_src;
+  wire [PHYS_W-1:0] c3pd = ld1_done ? ld1_pd  : c3_fpu_pd;
+  wire [63:0] c3val       = ld1_done ? ld1_val : c3_fpu_val;
+  wire [ROB_BITS-1:0] c3rob = ld1_done ? ld1_rtag : c3_fpu_rob;
 
   wire [63:0] lsq_h_addr = lsq_base[lsq_head] + lsq_imm[lsq_head];
 
@@ -777,6 +800,7 @@ module tinker_core (
       dq_ptgt[3]      <= 0;
 
       // EXT1 resets
+      fpu_stash_v <= 0; fpu1_stash_v <= 0;
       alu1_en <= 0; fpu1_en <= 0; ld1_done <= 0; ld1_isret <= 0;
       alu1_pd_p1 <= 0; alu1_vs_p1 <= 0;
       alu1_imovr_p1 <= 0; alu1_imovi_p1 <= 0; alu1_ical_p1 <= 0; alu1_iret_p1 <= 0;
@@ -926,6 +950,15 @@ module tinker_core (
         end
       end
 
+      // FPU0 stash: save FPU result when ld_done steals CDB1 this cycle
+      if (ld_done && fpu_vout) begin
+        fpu_stash_v   <= 1;
+        fpu_stash_pd  <= fp_pd;
+        fpu_stash_val <= fpu_res;
+        fpu_stash_rob <= fpu_tout[ROB_BITS-1:0];
+      end else if (fpu_stash_v && !ld_done)
+        fpu_stash_v <= 0;
+
       // ─── CDB2: ALU1 ───
       if (c2en && rob_valid[c2rob]) begin
         prf[c2pd]         <= c2val;
@@ -1024,6 +1057,15 @@ module tinker_core (
         end
       end
 
+      // FPU1 stash: save FPU1 result when ld1_done steals CDB3 this cycle
+      if (ld1_done && fpu1_vout) begin
+        fpu1_stash_v   <= 1;
+        fpu1_stash_pd  <= fp1_pd;
+        fpu1_stash_val <= fpu1_res;
+        fpu1_stash_rob <= fpu1_tout[ROB_BITS-1:0];
+      end else if (fpu1_stash_v && !ld1_done)
+        fpu1_stash_v <= 0;
+
       // ═══════════════════════════════════════════════
       // B. ROB COMMIT
       // ═══════════════════════════════════════════════
@@ -1093,6 +1135,8 @@ module tinker_core (
               prf[i]     <= arch_rf[i];
               prf_rdy[i] <= 1;
             end
+            // arch_rf is NBA-updated same cycle; bypass with just-committed result
+            if (rob_has_dest[ch]) prf[rob_arch[ch]] <= rob_result[ch];
             prf[31] <= arch_rf[31];
             for (i = 32; i < NPHYS; i = i + 1) prf_rdy[i] <= 1;
             for (i = 0; i < 32; i = i + 1) free_list[i] <= 6'(32 + i);
@@ -1519,7 +1563,7 @@ module tinker_core (
         end
 
         // ALU1 issue
-        if (rs_iss_found2) begin
+        if (rs_iss_found2) begin // ALU1 enabled
           alu1_en           <= 1;
           alu1_op           <= rs_op[rs_iss_idx2];
           alu1_a            <= rs_vs[rs_iss_idx2];
