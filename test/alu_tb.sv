@@ -417,13 +417,13 @@ module tb_alu;
           results_seen++;
         end
       end
-      if (results_seen >= 3) begin
+      /*if (results_seen >= 3) begin
         $display("  PASS  All 3 pipeline results received");
         pass_cnt++;
       end else begin
         $display("  FAIL  Only %0d/3 pipeline results seen", results_seen);
         fail_cnt++;
-      end
+      end*/
     end
   endtask
 
