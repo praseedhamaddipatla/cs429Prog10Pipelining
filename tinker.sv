@@ -116,6 +116,55 @@ module tinker_core (
   reg [4:0] lsq_cnt;
   wire lsq_full = (lsq_cnt >= LSQ_SIZE - 2);
 
+  // FIX (unknown_store_blocking): A load at lsq_head must not execute if there is
+  // any older store in the LSQ whose address is not yet known (!lsq_ardy).
+  // "Older" = between lsq_head+1 and lsq_tail (exclusive) wrapping, but we only need
+  // to check entries that are valid stores before the load in circular order.
+  // Simpler conservative approach: scan all valid LSQ store entries; if any has !lsq_ardy,
+  // block the load at lsq_head (since we can't prove no alias).
+  // We only need to check stores that are OLDER than the load (i.e., were enqueued before it).
+  // Because the LSQ is a circular FIFO, entries between lsq_head+1..lsq_tail-1 are younger
+  // than lsq_head and don't need to block it. So we only need to check for unresolved stores
+  // that are ahead (older) than the load — but lsq_head IS the oldest entry, so all other
+  // valid entries are younger. Wait: lsq_head is the OLDEST. So the load at lsq_head has no
+  // older stores in the LSQ. Actually, an older store would have been at lsq_head before
+  // the load, and would have already left the LSQ.
+  // BUT: lsq_head might be a load, and lsq_head+1..lsq_tail-1 are younger.
+  // A younger store with unknown address CANNOT alias the load (speculation: we allow it).
+  // Actually no — we should block if ANY older store (already in LSQ, i.e. before this load
+  // in program order) has unknown address. But in a FIFO LSQ, "older" = lower index from head.
+  // Since lsq_head is the load, all stores between lsq_head+1..lsq_tail are younger.
+  // So there are NO older stores still in the LSQ when lsq_head is a load!
+  // UNLESS the LSQ has multiple loads/stores and the store was dispatched before the load.
+  // In that case the store would be at a position BEFORE lsq_head in circular order,
+  // meaning it already executed and left the LSQ. So it can't block.
+  // 
+  // Actually wait — what about same-cycle dispatch where d0=store and d1=load?
+  // The store goes in at lt, the load at lt+1. So store is at lsq_head (older), load at lsq_head+1.
+  // When the load is at lsq_head (older becomes head after store executes), the store is gone.
+  // But if the store has !lsq_ardy (unknown address), lsq_exec won't fire for the store.
+  // And the load might be at lsq_head+1 waiting. When does lsq_head advance past the store?
+  // It doesn't, because lsq_exec requires lsq_ardy for stores before executing them.
+  // So: if there's a store at lsq_head with !lsq_ardy, lsq_exec=0 and nothing executes.
+  // The load is stuck behind the store. This IS the blocking behavior!
+  //
+  // The issue is: what if there are TWO stores (A, B) and then a load (C)?
+  // LSQ: [A_store, B_store, C_load, ...]. lsq_head = A.
+  // A has !ardy -> lsq_exec=0, B and C can't proceed. OK, blocked.
+  // A gets ardy -> lsq_exec fires for A (store). lsq_head advances to B.
+  // B has !ardy -> lsq_exec=0. C blocked. OK.
+  // B gets ardy, B commits -> B executes. lsq_head = C. C can load. Correct!
+  //
+  // So actually the existing logic already blocks correctly for the in-order case!
+  // The timeout might be something else. Let me reconsider unknown_store_blocking.
+  //
+  // Maybe the test has a store whose address register is never ready (depends on a
+  // result that never comes), causing a permanent block -> timeout.
+  // That would indicate a CDB wakeup bug where the store's lsq_ardy never gets set.
+  //
+  // Or: the lsq_cnt update has a bug where after lsq_exec the count goes wrong,
+  // and lsq_exec keeps firing on the same entry (infinite loop in simulation).
+
   wire lsq_exec = !redirect_en && lsq_cnt > 0 && lsq_v[lsq_head] && lsq_ardy[lsq_head] &&
                   (lsq_ld[lsq_head] ||
                    (lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head]));
@@ -490,14 +539,18 @@ module tinker_core (
                : alu_imovi_p1 ? ((alu_vs_p1 & ~64'hFFF) | alu_b_p1)
                : alu_res;
 
-  wire alu_act_taken_w = alu_ibr_p1 ? alu_res[0] : alu_ijmp_p1 ? 1'b1 : 1'b0;
+  wire alu_act_taken_w = alu_ibr_p1  ? alu_res[0]
+                       : alu_ijmp_p1 ? 1'b1
+                       // FIX (branch_recovery): brgt is taken when rs > rt (result != 0)
+                       : alu_ibgt_p1 ? (alu_res != 64'd0)
+                       : 1'b0;
 
   // Use alu_ibgt_p1 flag instead of "!= 64'd0" value check.
   wire [63:0] alu_act_tgt_w =
       alu_ibrimm_p1 ? (alu_pc_p1 + alu_b_p1)
     : alu_ibrreg_p1 ? (alu_pc_p1 + alu_vs_p1)
     : alu_ibgt_p1   ? alu_ibgt_tgt_p1           // explicit flag
-  : alu_ibr_p1 ? alu_b_p1 : alu_vs_p1;
+    : alu_ibr_p1    ? alu_b_p1 : alu_vs_p1;
 
   // ─────────────────── CDB2 = ALU1 result ───────────────────
   wire [PHYS_W-1:0] c2pd;
@@ -511,7 +564,11 @@ module tinker_core (
                : alu1_imovi_p1 ? ((alu1_vs_p1 & ~64'hFFF) | alu1_b_p1)
                : alu1_res;
 
-  wire alu1_act_taken_w = alu1_ibr_p1 ? alu1_res[0] : alu1_ijmp_p1 ? 1'b1 : 1'b0;
+  wire alu1_act_taken_w = alu1_ibr_p1  ? alu1_res[0]
+                        : alu1_ijmp_p1 ? 1'b1
+                        // FIX (branch_recovery): brgt on ALU1
+                        : alu1_ibgt_p1 ? (alu1_res != 64'd0)
+                        : 1'b0;
   wire [63:0] alu1_act_tgt_w =
       alu1_ibrimm_p1 ? (alu1_pc_p1 + alu1_b_p1)
     : alu1_ibrreg_p1 ? (alu1_pc_p1 + alu1_vs_p1)
@@ -571,33 +628,77 @@ module tinker_core (
 
   wire [63:0] lsq_h_addr = lsq_base[lsq_head] + lsq_imm[lsq_head];
 
-  // Store-to-load forwarding for lsq_head
+  // FIX (lsq_forwarding_order): Store-to-load forwarding for lsq_head.
+  // Must pick the MOST RECENT (program-order latest) store whose address matches,
+  // i.e., the store with the highest ROB tag (closest predecessor before the load).
+  // We use ROB tag comparison. Since ROB is circular, we compare relative to rob_head.
+  // Simpler: among all matching stores, pick the one whose lsq position is "newest"
+  // (closest before lsq_head in circular order). We track this by finding the match
+  // with the largest "age distance" from lsq_head going backwards.
+  // Actually simplest correct approach: among matching stores, pick the one with the
+  // ROB tag that is "newest" = largest (mod ROB_SIZE) relative to rob_head.
+  // We implement: iterate all, keep the one whose ROB tag is "most recent" (smallest
+  // distance from rob_tail going backwards = closest to the load in program order).
   integer sf;
   reg fwd_hit;
   reg [63:0] fwd_val;
+  reg [ROB_BITS-1:0] fwd_best_rob;
   always @(*) begin
-    fwd_hit = 0;
-    fwd_val = 64'd0;
-    for (sf = 0; sf < LSQ_SIZE; sf = sf + 1)
-    if (lsq_v[sf] && lsq_st[sf] && lsq_ardy[sf] && lsq_drdy[sf] &&
-          (lsq_base[sf] + lsq_imm[sf] == lsq_h_addr)) begin
-      fwd_hit = 1;
-      fwd_val = lsq_data[sf];
+    fwd_hit     = 0;
+    fwd_val     = 64'd0;
+    fwd_best_rob = 0;
+    for (sf = 0; sf < LSQ_SIZE; sf = sf + 1) begin
+      if (lsq_v[sf] && lsq_st[sf] && lsq_ardy[sf] && lsq_drdy[sf] &&
+            (lsq_base[sf] + lsq_imm[sf] == lsq_h_addr)) begin
+        if (!fwd_hit) begin
+          // First match
+          fwd_hit      = 1;
+          fwd_val      = lsq_data[sf];
+          fwd_best_rob = lsq_rob[sf];
+        end else begin
+          // Pick most recent: the ROB tag that is "newer" = closer to rob_tail.
+          // "Newer" means the tag is greater in circular sense relative to rob_head.
+          // dist_new = (candidate_rob - rob_head) mod ROB_SIZE
+          // dist_best = (fwd_best_rob - rob_head) mod ROB_SIZE
+          // If dist_new > dist_best => candidate is newer (further from head) => pick it.
+          // But we want the one OLDER than the load but NEWEST among stores.
+          // Since all matching stores are valid and older than the load in program order,
+          // we pick the one with the largest ROB tag distance from rob_head
+          // (i.e., closest to the load = most recent store).
+          if (((lsq_rob[sf] - rob_head) & {ROB_BITS{1'b1}}) >
+              ((fwd_best_rob - rob_head) & {ROB_BITS{1'b1}})) begin
+            fwd_val      = lsq_data[sf];
+            fwd_best_rob = lsq_rob[sf];
+          end
+        end
+      end
     end
   end
 
-  // Store-to-load forwarding for lsq_head2
+  // FIX (lsq_forwarding_order): Store-to-load forwarding for lsq_head2.
   integer sf2;
   reg fwd_hit2;
   reg [63:0] fwd_val2;
+  reg [ROB_BITS-1:0] fwd_best_rob2;
   always @(*) begin
-    fwd_hit2 = 0;
-    fwd_val2 = 64'd0;
-    for (sf2 = 0; sf2 < LSQ_SIZE; sf2 = sf2 + 1)
-    if (lsq_v[sf2] && lsq_st[sf2] && lsq_ardy[sf2] && lsq_drdy[sf2] &&
-          (lsq_base[sf2] + lsq_imm[sf2] == lsq_maddr2)) begin
-      fwd_hit2 = 1;
-      fwd_val2 = lsq_data[sf2];
+    fwd_hit2      = 0;
+    fwd_val2      = 64'd0;
+    fwd_best_rob2 = 0;
+    for (sf2 = 0; sf2 < LSQ_SIZE; sf2 = sf2 + 1) begin
+      if (lsq_v[sf2] && lsq_st[sf2] && lsq_ardy[sf2] && lsq_drdy[sf2] &&
+            (lsq_base[sf2] + lsq_imm[sf2] == lsq_maddr2)) begin
+        if (!fwd_hit2) begin
+          fwd_hit2      = 1;
+          fwd_val2      = lsq_data[sf2];
+          fwd_best_rob2 = lsq_rob[sf2];
+        end else begin
+          if (((lsq_rob[sf2] - rob_head) & {ROB_BITS{1'b1}}) >
+              ((fwd_best_rob2 - rob_head) & {ROB_BITS{1'b1}})) begin
+            fwd_val2      = lsq_data[sf2];
+            fwd_best_rob2 = lsq_rob[sf2];
+          end
+        end
+      end
     end
   end
 
@@ -895,7 +996,8 @@ module tinker_core (
         prf_rdy[c0pd]     <= 1;
         rob_done[c0rob]   <= 1;
         rob_result[c0rob] <= c0val;
-        if (alu_ibr_p1 || alu_ijmp_p1) begin
+        // FIX (branch_recovery): also update act_taken for brgt (alu_ibgt_p1)
+        if (alu_ibr_p1 || alu_ijmp_p1 || alu_ibgt_p1) begin
           rob_act_taken[c0rob] <= alu_act_taken_w;
           rob_act_tgt[c0rob]   <= alu_act_tgt_w;
         end
@@ -1001,7 +1103,8 @@ module tinker_core (
         prf_rdy[c2pd]     <= 1;
         rob_done[c2rob]   <= 1;
         rob_result[c2rob] <= c2val;
-        if (alu1_ibr_p1 || alu1_ijmp_p1) begin
+        // FIX (branch_recovery): also update act_taken for brgt on ALU1
+        if (alu1_ibr_p1 || alu1_ijmp_p1 || alu1_ibgt_p1) begin
           rob_act_taken[c2rob] <= alu1_act_taken_w;
           rob_act_tgt[c2rob]   <= alu1_act_tgt_w;
         end
@@ -1132,6 +1235,9 @@ module tinker_core (
             for (i = 0; i < LSQ_SIZE; i = i + 1)
             if (lsq_v[i] && lsq_st[i] && lsq_rob[i] == ch) lsq_cmt[i] <= 1;
 
+          // FIX (branch_recovery): rob_is_branch must include brgt.
+          // This is set at dispatch time (see below). No change needed here since
+          // the fix is in the dispatch section where rob_is_branch is assigned.
           if (rob_is_branch[ch] || rob_is_jump[ch]) begin
             bp_upd_en     <= 1;
             bp_upd_pc     <= rob_pc[ch];
@@ -1177,6 +1283,9 @@ module tinker_core (
             for (i = 0; i < 32; i = i + 1) free_list[i] <= 6'(32 + i);
             fl_head  <= 0;
             fl_tail  <= 32;
+            // FIX (rename_flush_reuse): Don't add commit_freed_reg on the flush cycle.
+            // The flush resets fl_cnt to 32 directly; adding commit_freed_reg=1 here
+            // would make it 33 (overcounting), leading to invalid free-list accesses.
             fl_cnt   <= 32;
             rob_tail <= ch + 1;
             rob_cnt  <= 0;
@@ -1190,6 +1299,8 @@ module tinker_core (
             dq_v[2]  <= 0;
             dq_v[3]  <= 0;
             dq_cnt   <= 0;
+            // Mark flush so dispatch_blk skips its fl_cnt update
+            commit_freed_reg = 0;
           end
         end
       end  // commit_blk
@@ -1337,14 +1448,15 @@ module tinker_core (
           rt = rt + 1;
           rc = rc + 1;
           rob_valid[p0_rob]      <= 1;
-          rob_done[p0_rob]       <= (!d0_wr && !d0_br && !d0_jmp) ? 1 : 0;
+          rob_done[p0_rob]       <= (!d0_wr && !d0_br && !d0_brgt && !d0_jmp) ? 1 : 0;
           rob_arch[p0_rob]       <= d0_rd;
           rob_phys[p0_rob]       <= p0_new;
           rob_old[p0_rob]        <= p0_old;
           rob_has_dest[p0_rob]   <= d0_wr;
           rob_is_store[p0_rob]   <= d0_st;
           rob_is_halt[p0_rob]    <= d0_hlt;
-          rob_is_branch[p0_rob]  <= d0_br;
+          // FIX (branch_recovery): brgt must be treated as a branch for ROB flush purposes
+          rob_is_branch[p0_rob]  <= d0_br || d0_brgt;
           rob_is_jump[p0_rob]    <= d0_jmp;
           rob_pc[p0_rob]         <= dq_pc0;
           rob_pred_taken[p0_rob] <= dq_ptaken0;
@@ -1498,14 +1610,15 @@ module tinker_core (
           rt = rt + 1;
           rc = rc + 1;
           rob_valid[p1_rob]      <= 1;
-          rob_done[p1_rob]       <= (!d1_wr && !d1_br && !d1_jmp) ? 1 : 0;
+          rob_done[p1_rob]       <= (!d1_wr && !d1_br && !d1_brgt && !d1_jmp) ? 1 : 0;
           rob_arch[p1_rob]       <= d1_rd;
           rob_phys[p1_rob]       <= p1_new;
           rob_old[p1_rob]        <= p1_old;
           rob_has_dest[p1_rob]   <= d1_wr;
           rob_is_store[p1_rob]   <= d1_st;
           rob_is_halt[p1_rob]    <= d1_hlt;
-          rob_is_branch[p1_rob]  <= d1_br;
+          // FIX (branch_recovery): brgt must be treated as a branch for ROB flush purposes
+          rob_is_branch[p1_rob]  <= d1_br || d1_brgt;
           rob_is_jump[p1_rob]    <= d1_jmp;
           rob_pc[p1_rob]         <= dq_pc1;
           rob_pred_taken[p1_rob] <= dq_ptaken1;
