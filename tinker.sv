@@ -1,4 +1,5 @@
 // tinker.sv — tinker cpu core (ooo, dual-issue)
+// Based on working single-issue baseline with dual ALU/FPU, 64-byte fetch, FPU stash added
 
 `define MEM_SIZE (512 * 1024)
 `define PC_START 64'h2000
@@ -116,74 +117,24 @@ module tinker_core (
   reg [4:0] lsq_cnt;
   wire lsq_full = (lsq_cnt >= LSQ_SIZE - 2);
 
-  // FIX (unknown_store_blocking): A load at lsq_head must not execute if there is
-  // any older store in the LSQ whose address is not yet known (!lsq_ardy).
-  // "Older" = between lsq_head+1 and lsq_tail (exclusive) wrapping, but we only need
-  // to check entries that are valid stores before the load in circular order.
-  // Simpler conservative approach: scan all valid LSQ store entries; if any has !lsq_ardy,
-  // block the load at lsq_head (since we can't prove no alias).
-  // We only need to check stores that are OLDER than the load (i.e., were enqueued before it).
-  // Because the LSQ is a circular FIFO, entries between lsq_head+1..lsq_tail-1 are younger
-  // than lsq_head and don't need to block it. So we only need to check for unresolved stores
-  // that are ahead (older) than the load — but lsq_head IS the oldest entry, so all other
-  // valid entries are younger. Wait: lsq_head is the OLDEST. So the load at lsq_head has no
-  // older stores in the LSQ. Actually, an older store would have been at lsq_head before
-  // the load, and would have already left the LSQ.
-  // BUT: lsq_head might be a load, and lsq_head+1..lsq_tail-1 are younger.
-  // A younger store with unknown address CANNOT alias the load (speculation: we allow it).
-  // Actually no — we should block if ANY older store (already in LSQ, i.e. before this load
-  // in program order) has unknown address. But in a FIFO LSQ, "older" = lower index from head.
-  // Since lsq_head is the load, all stores between lsq_head+1..lsq_tail are younger.
-  // So there are NO older stores still in the LSQ when lsq_head is a load!
-  // UNLESS the LSQ has multiple loads/stores and the store was dispatched before the load.
-  // In that case the store would be at a position BEFORE lsq_head in circular order,
-  // meaning it already executed and left the LSQ. So it can't block.
-  // 
-  // Actually wait — what about same-cycle dispatch where d0=store and d1=load?
-  // The store goes in at lt, the load at lt+1. So store is at lsq_head (older), load at lsq_head+1.
-  // When the load is at lsq_head (older becomes head after store executes), the store is gone.
-  // But if the store has !lsq_ardy (unknown address), lsq_exec won't fire for the store.
-  // And the load might be at lsq_head+1 waiting. When does lsq_head advance past the store?
-  // It doesn't, because lsq_exec requires lsq_ardy for stores before executing them.
-  // So: if there's a store at lsq_head with !lsq_ardy, lsq_exec=0 and nothing executes.
-  // The load is stuck behind the store. This IS the blocking behavior!
-  //
-  // The issue is: what if there are TWO stores (A, B) and then a load (C)?
-  // LSQ: [A_store, B_store, C_load, ...]. lsq_head = A.
-  // A has !ardy -> lsq_exec=0, B and C can't proceed. OK, blocked.
-  // A gets ardy -> lsq_exec fires for A (store). lsq_head advances to B.
-  // B has !ardy -> lsq_exec=0. C blocked. OK.
-  // B gets ardy, B commits -> B executes. lsq_head = C. C can load. Correct!
-  //
-  // So actually the existing logic already blocks correctly for the in-order case!
-  // The timeout might be something else. Let me reconsider unknown_store_blocking.
-  //
-  // Maybe the test has a store whose address register is never ready (depends on a
-  // result that never comes), causing a permanent block -> timeout.
-  // That would indicate a CDB wakeup bug where the store's lsq_ardy never gets set.
-  //
-  // Or: the lsq_cnt update has a bug where after lsq_exec the count goes wrong,
-  // and lsq_exec keeps firing on the same entry (infinite loop in simulation).
-
   wire lsq_exec = !redirect_en && lsq_cnt > 0 && lsq_v[lsq_head] && lsq_ardy[lsq_head] &&
                   (lsq_ld[lsq_head] ||
                    (lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head]));
 
-  // Second LSQ execute slot: only dual-execute two loads
+  // Second LSQ execute slot: dual-execute two consecutive loads only
   wire [2:0] lsq_head2 = lsq_head + 3'd1;
   wire lsq_exec2 = !redirect_en && lsq_exec && lsq_cnt > 1 &&
-                   lsq_v[lsq_head2] && lsq_ardy[lsq_head2] && lsq_ld[lsq_head2] &&
-                   lsq_ld[lsq_head]; // only dual-execute two loads
+                   lsq_v[lsq_head2] && lsq_ardy[lsq_head2] &&
+                   lsq_ld[lsq_head2] && lsq_ld[lsq_head];
 
-  // 4-entry decode queue
+  // 4-entry decode queue (64-byte fetch)
   reg dq_v[0:3];
   reg [31:0] dq_i[0:3];
   reg [63:0] dq_pc[0:3];
   reg dq_ptaken[0:3];
   reg [63:0] dq_ptgt[0:3];
-  reg [2:0] dq_cnt;  // number of valid entries
+  reg [2:0] dq_cnt;
 
-  // Aliases for compatibility with dispatch logic
   wire dq_v0 = dq_v[0];
   wire [31:0] dq_i0 = dq_i[0];
   wire [63:0] dq_pc0 = dq_pc[0];
@@ -213,25 +164,24 @@ module tinker_core (
 
   wire       stall = rob_full || rs_full || fp_full || lsq_full;
   wire       d0_en = dq_v0 && !stall;
-  wire       d0_ctrl = d0_jmp || d0_br || d0_brgt || d0_call || d0_ret;
+  wire       d0_ctrl = d0_jmp || d0_br || d0_call || d0_ret;
   wire       d1_en = dq_v1 && !stall && !d0_hlt && !(d0_en && d0_ctrl);
 
-  // ─────────────────── ALU0 pipeline ───────────────────
+  // ── ALU0 pipeline ──
   reg        alu_en;
   reg  [4:0] alu_op;
   reg [63:0] alu_a, alu_b;
   reg [5:0] alu_rtag;
   reg [PHYS_W-1:0] alu_pd;
-
   reg [63:0] alu_vs_p, alu_pc_p;
   reg alu_ibr_p, alu_ibgt_p, alu_ijmp_p;
   reg alu_ibrreg_p, alu_ibrimm_p;
-  reg alu_imovr_p, alu_imovi_p;
-  reg alu_ical_p, alu_iret_p;
+  reg alu_imovr_p, alu_imovi_p, alu_ical_p, alu_iret_p;
   reg        alu_ptaken_p;
   reg [63:0] alu_ptgt_p;
+  reg [63:0] alu_ibgt_tgt_p;
 
-  // ─────────────────── ALU1 pipeline ───────────────────
+  // ── ALU1 pipeline ──
   reg        alu1_en;
   reg [ 4:0] alu1_op;
   reg [63:0] alu1_a, alu1_b;
@@ -243,67 +193,58 @@ module tinker_core (
   reg alu1_imovr_p, alu1_imovi_p, alu1_ical_p, alu1_iret_p;
   reg alu1_ptaken_p;
   reg [63:0] alu1_ptgt_p, alu1_ibgt_tgt_p;
-  reg [PHYS_W-1:0] alu1_pd_p1;
-  reg [63:0] alu1_vs_p1, alu1_pc_p1, alu1_b_p1, alu1_ibgt_tgt_p1;
-  reg alu1_imovr_p1, alu1_imovi_p1, alu1_ical_p1, alu1_iret_p1;
-  reg alu1_ibr_p1, alu1_ijmp_p1, alu1_ibgt_p1, alu1_ibrreg_p1, alu1_ibrimm_p1;
-  wire        alu1_vout;
-  wire [63:0] alu1_res;
-  wire [ 5:0] alu1_tout;
 
-  // ─────────────────── FPU0 pipeline ───────────────────
-  reg         fpu_en;
-  reg  [ 4:0] fpu_op;
+  // ── FPU0 pipeline ──
+  reg       fpu_en;
+  reg [4:0] fpu_op;
   reg [63:0] fpu_a, fpu_b;
   reg [       5:0] fpu_rtag;
   reg [PHYS_W-1:0] fpu_pd;
-
   reg [PHYS_W-1:0] fp_pd_p  [0:2];
 
-  // ─────────────────── FPU1 pipeline ───────────────────
+  // ── FPU1 pipeline ──
   reg              fpu1_en;
   reg [       4:0] fpu1_op;
   reg [63:0] fpu1_a, fpu1_b;
-  reg [5:0] fpu1_rtag;
-  reg [PHYS_W-1:0] fpu1_pd;
-  reg [PHYS_W-1:0] fp1_pd_p[0:2];
-  wire fpu1_vout;
-  wire [63:0] fpu1_res;
-  wire [5:0] fpu1_tout;
-  wire fpu1_is_add = (fpu1_op == 5'd10);
-  wire fpu1_is_sub = (fpu1_op == 5'd11);
-  wire fpu1_is_mul = (fpu1_op == 5'd12);
-  wire fpu1_is_div = (fpu1_op == 5'd13);
-  reg [2:0] fpu1_sel;
-  always @(*) begin
-    if (fpu1_is_add) fpu1_sel = 3'd0;
-    else if (fpu1_is_sub) fpu1_sel = 3'd1;
-    else if (fpu1_is_mul) fpu1_sel = 3'd2;
-    else if (fpu1_is_div) fpu1_sel = 3'd3;
-    else fpu1_sel = 3'd0;
-  end
+  reg  [       5:0] fpu1_rtag;
+  reg  [PHYS_W-1:0] fpu1_pd;
+  reg  [PHYS_W-1:0] fp1_pd_p                         [0:2];
 
-  // ─────────────────── ALU/FPU outputs ───────────────────
-  wire        alu_vout;
-  wire [63:0] alu_res;
-  wire [ 5:0] alu_tout;
+  // ALU/FPU outputs
+  wire              alu_vout;
+  wire [      63:0] alu_res;
+  wire [       5:0] alu_tout;
+  wire              alu1_vout;
+  wire [      63:0] alu1_res;
+  wire [       5:0] alu1_tout;
+  wire              fpu_vout;
+  wire [      63:0] fpu_res;
+  wire [       5:0] fpu_tout;
+  wire              fpu1_vout;
+  wire [      63:0] fpu1_res;
+  wire [       5:0] fpu1_tout;
 
-  wire        fpu_vout;
-  wire [63:0] fpu_res;
-  wire [ 5:0] fpu_tout;
+  wire              fpu_is_add = (fpu_op == 5'd10);
+  wire              fpu_is_sub = (fpu_op == 5'd11);
+  wire              fpu_is_mul = (fpu_op == 5'd12);
+  wire              fpu_is_div = (fpu_op == 5'd13);
+  wire              fpu1_is_add = (fpu1_op == 5'd10);
+  wire              fpu1_is_sub = (fpu1_op == 5'd11);
+  wire              fpu1_is_mul = (fpu1_op == 5'd12);
+  wire              fpu1_is_div = (fpu1_op == 5'd13);
 
-  wire        fpu_is_add = (fpu_op == 5'd10);
-  wire        fpu_is_sub = (fpu_op == 5'd11);
-  wire        fpu_is_mul = (fpu_op == 5'd12);
-  wire        fpu_is_div = (fpu_op == 5'd13);
-
-  reg  [ 2:0] fpu_sel;
+  reg [2:0] fpu_sel, fpu1_sel;
   always @(*) begin
     if (fpu_is_add) fpu_sel = 3'd0;
     else if (fpu_is_sub) fpu_sel = 3'd1;
     else if (fpu_is_mul) fpu_sel = 3'd2;
     else if (fpu_is_div) fpu_sel = 3'd3;
     else fpu_sel = 3'd0;
+    if (fpu1_is_add) fpu1_sel = 3'd0;
+    else if (fpu1_is_sub) fpu1_sel = 3'd1;
+    else if (fpu1_is_mul) fpu1_sel = 3'd2;
+    else if (fpu1_is_div) fpu1_sel = 3'd3;
+    else fpu1_sel = 3'd0;
   end
 
   alu alu (
@@ -318,7 +259,6 @@ module tinker_core (
       .result(alu_res),
       .rob_tag_out(alu_tout)
   );
-
   alu u_alu1 (
       .clk(clk),
       .reset(reset),
@@ -331,7 +271,6 @@ module tinker_core (
       .result(alu1_res),
       .rob_tag_out(alu1_tout)
   );
-
   fpu fpu (
       .clk(clk),
       .reset(reset),
@@ -344,7 +283,6 @@ module tinker_core (
       .result(fpu_res),
       .rob_tag_out(fpu_tout)
   );
-
   fpu u_fpu1 (
       .clk(clk),
       .reset(reset),
@@ -360,8 +298,7 @@ module tinker_core (
 
   reg [63:0] pc_reg;
   wire [31:0] mem_i0, mem_i1, mem_i2, mem_i3;
-  reg  [63:0] lsq_maddr;
-  reg  [63:0] lsq_mwdata;
+  reg [63:0] lsq_maddr, lsq_mwdata;
   reg         lsq_mwe;
   wire [63:0] lsq_mrdata;
   wire [63:0] lsq_maddr2 = lsq_v[lsq_head2] ? (lsq_base[lsq_head2] + lsq_imm[lsq_head2]) : 64'd0;
@@ -403,7 +340,6 @@ module tinker_core (
       .upd_taken(bp_upd_taken),
       .upd_target(bp_upd_target)
   );
-
   branch_predictor u_bp1 (
       .clk(clk),
       .reset(reset),
@@ -458,7 +394,6 @@ module tinker_core (
       .is_mov_imm(d0_mvi),
       .rt_addr(d0_rtx)
   );
-
   decoder u_d1 (
       .instr(dq_i1),
       .raddr1(d1_rs),
@@ -483,23 +418,17 @@ module tinker_core (
       .rt_addr(d1_rtx)
   );
 
-  // ─────────────────── CDB0 = ALU0 result ───────────────────
-  wire                c0en = alu_vout;
-  wire [  PHYS_W-1:0] c0pd;
-  wire [        63:0] c0val;
-  wire [ROB_BITS-1:0] c0rob = alu_tout[ROB_BITS-1:0];
+  // ── CDB0: ALU0 (with 1-cycle pipeline registers) ──
+  reg [PHYS_W-1:0] alu_pd_p1;
+  reg [63:0] alu_vs_p1, alu_pc_p1, alu_b_p1, alu_ibgt_tgt_p1;
+  reg alu_imovr_p1, alu_imovi_p1, alu_ical_p1, alu_iret_p1;
+  reg alu_ibr_p1, alu_ijmp_p1, alu_ibgt_p1, alu_ibrreg_p1, alu_ibrimm_p1;
 
-  reg  [  PHYS_W-1:0] alu_pd_p1;
-  reg  [        63:0] alu_vs_p1;
-  reg alu_imovr_p1, alu_imovi_p1;
-  reg alu_ical_p1, alu_iret_p1;
-  reg alu_ibr_p1, alu_ijmp_p1;
-  reg alu_ibgt_p1;  // registered brgt flag
-  reg alu_ibrreg_p1, alu_ibrimm_p1;
-  reg [63:0] alu_pc_p1;
-  reg [63:0] alu_b_p1;
-  reg [63:0] alu_ibgt_tgt_p;
-  reg [63:0] alu_ibgt_tgt_p1;
+  // ── CDB2: ALU1 (with 1-cycle pipeline registers) ──
+  reg [PHYS_W-1:0] alu1_pd_p1;
+  reg [63:0] alu1_vs_p1, alu1_pc_p1, alu1_b_p1, alu1_ibgt_tgt_p1;
+  reg alu1_imovr_p1, alu1_imovi_p1, alu1_ical_p1, alu1_iret_p1;
+  reg alu1_ibr_p1, alu1_ijmp_p1, alu1_ibgt_p1, alu1_ibrreg_p1, alu1_ibrimm_p1;
 
   always @(posedge clk) begin
     alu_pd_p1        <= alu_pd;
@@ -516,7 +445,7 @@ module tinker_core (
     alu_pc_p1        <= alu_pc_p;
     alu_b_p1         <= alu_b;
     alu_ibgt_tgt_p1  <= alu_ibgt_tgt_p;
-    // ALU1 stage-1 pipeline registers
+
     alu1_pd_p1       <= alu1_pd;
     alu1_vs_p1       <= alu1_a;
     alu1_imovr_p1    <= alu1_imovr_p;
@@ -533,49 +462,31 @@ module tinker_core (
     alu1_ibgt_tgt_p1 <= alu1_ibgt_tgt_p;
   end
 
-  assign c0pd = alu_pd_p1;
-  assign c0val = alu_imovr_p1 ? alu_vs_p1
-               : alu_ical_p1  ? (alu_pc_p1 + 64'd4)
-               : alu_imovi_p1 ? ((alu_vs_p1 & ~64'hFFF) | alu_b_p1)
-               : alu_res;
-
-  wire alu_act_taken_w = alu_ibr_p1  ? alu_res[0]
-                       : alu_ijmp_p1 ? 1'b1
-                       // FIX (branch_recovery): brgt is taken when rs > rt (result != 0)
-                       : alu_ibgt_p1 ? (alu_res != 64'd0)
-                       : 1'b0;
-
-  // Use alu_ibgt_p1 flag instead of "!= 64'd0" value check.
+  wire c0en = alu_vout;
+  wire [PHYS_W-1:0] c0pd = alu_pd_p1;
+  wire [ROB_BITS-1:0] c0rob = alu_tout[ROB_BITS-1:0];
+  wire [63:0] c0val = alu_imovr_p1  ? alu_vs_p1
+                    : alu_ical_p1   ? (alu_pc_p1 + 64'd4)
+                    : alu_imovi_p1  ? ((alu_vs_p1 & ~64'hFFF) | alu_b_p1)
+                    : alu_res;
+  wire alu_act_taken_w = alu_ibr_p1 ? alu_res[0] : alu_ijmp_p1 ? 1'b1 : 1'b0;
   wire [63:0] alu_act_tgt_w =
-      alu_ibrimm_p1 ? (alu_pc_p1 + alu_b_p1)
-    : alu_ibrreg_p1 ? (alu_pc_p1 + alu_vs_p1)
-    : alu_ibgt_p1   ? alu_ibgt_tgt_p1           // explicit flag
-    : alu_ibr_p1    ? alu_b_p1 : alu_vs_p1;
+      alu_ibrimm_p1 ? (alu_pc_p1 + alu_b_p1) : alu_ibrreg_p1 ? (alu_pc_p1 + alu_vs_p1)
+    : alu_ibgt_p1   ? alu_ibgt_tgt_p1 : alu_ibr_p1 ? alu_b_p1 : alu_vs_p1;
 
-  // ─────────────────── CDB2 = ALU1 result ───────────────────
-  wire [PHYS_W-1:0] c2pd;
-  wire [63:0] c2val;
   wire c2en = alu1_vout;
+  wire [PHYS_W-1:0] c2pd = alu1_pd_p1;
   wire [ROB_BITS-1:0] c2rob = alu1_tout[ROB_BITS-1:0];
-
-  assign c2pd = alu1_pd_p1;
-  assign c2val = alu1_imovr_p1 ? alu1_vs_p1
-               : alu1_ical_p1  ? (alu1_pc_p1 + 64'd4)
-               : alu1_imovi_p1 ? ((alu1_vs_p1 & ~64'hFFF) | alu1_b_p1)
-               : alu1_res;
-
-  wire alu1_act_taken_w = alu1_ibr_p1  ? alu1_res[0]
-                        : alu1_ijmp_p1 ? 1'b1
-                        // FIX (branch_recovery): brgt on ALU1
-                        : alu1_ibgt_p1 ? (alu1_res != 64'd0)
-                        : 1'b0;
+  wire [63:0] c2val = alu1_imovr_p1  ? alu1_vs_p1
+                    : alu1_ical_p1   ? (alu1_pc_p1 + 64'd4)
+                    : alu1_imovi_p1  ? ((alu1_vs_p1 & ~64'hFFF) | alu1_b_p1)
+                    : alu1_res;
+  wire alu1_act_taken_w = alu1_ibr_p1 ? alu1_res[0] : alu1_ijmp_p1 ? 1'b1 : 1'b0;
   wire [63:0] alu1_act_tgt_w =
-      alu1_ibrimm_p1 ? (alu1_pc_p1 + alu1_b_p1)
-    : alu1_ibrreg_p1 ? (alu1_pc_p1 + alu1_vs_p1)
-    : alu1_ibgt_p1   ? alu1_ibgt_tgt_p1
-    : alu1_ibr_p1    ? alu1_b_p1 : alu1_vs_p1;
+      alu1_ibrimm_p1 ? (alu1_pc_p1 + alu1_b_p1) : alu1_ibrreg_p1 ? (alu1_pc_p1 + alu1_vs_p1)
+    : alu1_ibgt_p1   ? alu1_ibgt_tgt_p1 : alu1_ibr_p1 ? alu1_b_p1 : alu1_vs_p1;
 
-  // ─────────────────── CDB1 = LD0 or FPU0 ───────────────────
+  // ── CDB1: LD0 / FPU0 (with FPU stash for collision handling) ──
   wire [PHYS_W-1:0] fp_pd = fp_pd_p[2];
 
   reg ld_done;
@@ -584,13 +495,11 @@ module tinker_core (
   reg [ROB_BITS-1:0] ld_rtag;
   reg ld_isret;
 
-  // FPU0 stash: holds FPU result when ld_done and fpu_vout collide on CDB1
   reg fpu_stash_v;
   reg [PHYS_W-1:0] fpu_stash_pd;
   reg [63:0] fpu_stash_val;
   reg [ROB_BITS-1:0] fpu_stash_rob;
 
-  // CDB1 picks: load > stashed FPU > fresh FPU
   wire c1_fpu_src = fpu_stash_v | fpu_vout;
   wire [PHYS_W-1:0] c1_fpu_pd = fpu_stash_v ? fpu_stash_pd : fp_pd;
   wire [63:0] c1_fpu_val = fpu_stash_v ? fpu_stash_val : fpu_res;
@@ -601,7 +510,7 @@ module tinker_core (
   wire [63:0] c1val = ld_done ? ld_val : c1_fpu_val;
   wire [ROB_BITS-1:0] c1rob = ld_done ? ld_rtag : c1_fpu_rob;
 
-  // ─────────────────── CDB3 = LD1 or FPU1 ───────────────────
+  // ── CDB3: LD1 / FPU1 (with FPU1 stash) ──
   wire [PHYS_W-1:0] fp1_pd = fp1_pd_p[2];
 
   reg ld1_done;
@@ -610,7 +519,6 @@ module tinker_core (
   reg [ROB_BITS-1:0] ld1_rtag;
   reg ld1_isret;
 
-  // FPU1 stash: holds FPU1 result when ld1_done and fpu1_vout collide on CDB3
   reg fpu1_stash_v;
   reg [PHYS_W-1:0] fpu1_stash_pd;
   reg [63:0] fpu1_stash_val;
@@ -628,71 +536,47 @@ module tinker_core (
 
   wire [63:0] lsq_h_addr = lsq_base[lsq_head] + lsq_imm[lsq_head];
 
-  // FIX (lsq_forwarding_order): Store-to-load forwarding for lsq_head.
-  // Must pick the MOST RECENT (program-order latest) store whose address matches,
-  // i.e., the store with the highest ROB tag (closest predecessor before the load).
-  // We use ROB tag comparison. Since ROB is circular, we compare relative to rob_head.
-  // Simpler: among all matching stores, pick the one whose lsq position is "newest"
-  // (closest before lsq_head in circular order). We track this by finding the match
-  // with the largest "age distance" from lsq_head going backwards.
-  // Store-to-load forwarding for lsq_head.
-  // FIX (lsq_forwarding_order): Must pick the MOST RECENT store that is OLDER than
-  // the load (in program order). "Older" means smaller circular distance from rob_head.
-  // Among all older matching stores, pick the one with the LARGEST distance from rob_head
-  // (= most recently dispatched store before the load = the one whose value takes effect).
-  // load_dist = (lsq_rob[lsq_head] - rob_head) mod ROB_SIZE
-  // store is older iff (lsq_rob[sf] - rob_head) mod ROB_SIZE < load_dist
+  // Store-to-load forwarding: pick most recent OLDER store with matching address
   integer sf;
   reg fwd_hit;
   reg [63:0] fwd_val;
-  reg [ROB_BITS-1:0] fwd_best_rob;
+  reg [ROB_BITS-1:0] fwd_best;
   always @(*) begin
-    fwd_hit      = 0;
-    fwd_val      = 64'd0;
-    fwd_best_rob = 0;
-    for (sf = 0; sf < LSQ_SIZE; sf = sf + 1) begin
-      if (lsq_v[sf] && lsq_st[sf] && lsq_ardy[sf] && lsq_drdy[sf] &&
-            sf != lsq_head &&
-            (lsq_base[sf] + lsq_imm[sf] == lsq_h_addr)) begin
-        // Check store is older than load: store_dist < load_dist (both mod ROB_SIZE)
-        if (((lsq_rob[sf]       - rob_head) & {ROB_BITS{1'b1}}) <
-            ((lsq_rob[lsq_head] - rob_head) & {ROB_BITS{1'b1}})) begin
-          // Store is older than load. Is it more recent than our best match?
-          if (!fwd_hit ||
-              ((lsq_rob[sf] - rob_head) & {ROB_BITS{1'b1}}) >
-              ((fwd_best_rob  - rob_head) & {ROB_BITS{1'b1}})) begin
-            fwd_hit      = 1;
-            fwd_val      = lsq_data[sf];
-            fwd_best_rob = lsq_rob[sf];
-          end
+    fwd_hit  = 0;
+    fwd_val  = 64'd0;
+    fwd_best = 0;
+    for (sf = 0; sf < LSQ_SIZE; sf = sf + 1)
+    if (lsq_v[sf] && lsq_st[sf] && lsq_ardy[sf] && lsq_drdy[sf] &&
+          sf != lsq_head &&
+          (lsq_base[sf] + lsq_imm[sf] == lsq_h_addr)) begin
+      // only forward from stores older than the load (smaller ROB distance from head)
+      if ((lsq_rob[sf][ROB_BITS-1:0] - rob_head) < (lsq_rob[lsq_head][ROB_BITS-1:0] - rob_head)) begin
+        if (!fwd_hit || ((lsq_rob[sf][ROB_BITS-1:0] - rob_head) > (fwd_best - rob_head))) begin
+          fwd_hit  = 1;
+          fwd_val  = lsq_data[sf];
+          fwd_best = lsq_rob[sf][ROB_BITS-1:0];
         end
       end
     end
   end
 
-  // Store-to-load forwarding for lsq_head2.
-  // FIX (lsq_forwarding_order): Same logic - only forward from stores older than the load.
   integer sf2;
   reg fwd_hit2;
   reg [63:0] fwd_val2;
-  reg [ROB_BITS-1:0] fwd_best_rob2;
+  reg [ROB_BITS-1:0] fwd_best2;
   always @(*) begin
-    fwd_hit2      = 0;
-    fwd_val2      = 64'd0;
-    fwd_best_rob2 = 0;
-    for (sf2 = 0; sf2 < LSQ_SIZE; sf2 = sf2 + 1) begin
-      if (lsq_v[sf2] && lsq_st[sf2] && lsq_ardy[sf2] && lsq_drdy[sf2] &&
-            sf2 != lsq_head2 &&
-            (lsq_base[sf2] + lsq_imm[sf2] == lsq_maddr2)) begin
-        if (((lsq_rob[sf2]        - rob_head) & {ROB_BITS{1'b1}}) <
-            ((lsq_rob[lsq_head2]  - rob_head) & {ROB_BITS{1'b1}})) begin
-          if (!fwd_hit2 ||
-              ((lsq_rob[sf2]   - rob_head) & {ROB_BITS{1'b1}}) >
-              ((fwd_best_rob2  - rob_head) & {ROB_BITS{1'b1}})) begin
-            fwd_hit2      = 1;
-            fwd_val2      = lsq_data[sf2];
-            fwd_best_rob2 = lsq_rob[sf2];
-          end
+    fwd_hit2  = 0;
+    fwd_val2  = 64'd0;
+    fwd_best2 = 0;
+    for (sf2 = 0; sf2 < LSQ_SIZE; sf2 = sf2 + 1)
+    if (lsq_v[sf2] && lsq_st[sf2] && lsq_ardy[sf2] && lsq_drdy[sf2] &&
+          sf2 != lsq_head2 &&
+          (lsq_base[sf2] + lsq_imm[sf2] == lsq_maddr2)) begin
+      if ((lsq_rob[sf2][ROB_BITS-1:0] - rob_head) < (lsq_rob[lsq_head2][ROB_BITS-1:0] - rob_head)) begin
+        if (!fwd_hit2 || ((lsq_rob[sf2][ROB_BITS-1:0] - rob_head) > (fwd_best2 - rob_head))) begin
+          fwd_hit2  = 1;
+          fwd_val2  = lsq_data[sf2];
+          fwd_best2 = lsq_rob[sf2][ROB_BITS-1:0];
         end
       end
     end
@@ -707,11 +591,8 @@ module tinker_core (
   reg [63:0] bp_upd_target;
   reg        commit_happened;
   reg        commit_freed_reg;
-
   reg        call_pending;
-  reg [63:0] call_tgt;
-  reg [63:0] call_addr;
-  reg [63:0] call_wdata;
+  reg [63:0] call_tgt, call_addr, call_wdata;
   reg        ret_pending;
   reg [63:0] ret_addr;
 
@@ -725,39 +606,35 @@ module tinker_core (
     for (i = RS_FP - 1; i >= 0; i = i - 1) if (!fp_v[i]) fp_free_slot = i;
   end
 
-  // RS issue slot 0
-  integer rs_iss_idx;
-  reg     rs_iss_found;
+  // RS issue: two ready slots
+  integer rs_iss_idx, rs_iss_idx2;
+  reg rs_iss_found, rs_iss_found2;
   always @(*) begin
     rs_iss_idx   = 0;
     rs_iss_found = 0;
     for (i = 0; i < RS_INT; i = i + 1)
     if (!rs_iss_found && rs_v[i] && rs_psrdy[i] && (rs_uimm[i] || rs_ptrdy[i]) &&
-        (!rs_ibgt[i] || rs_pt3rdy[i])) begin
+          (!rs_ibgt[i] || rs_pt3rdy[i])) begin
       rs_iss_idx   = i;
       rs_iss_found = 1;
     end
   end
-
-  // RS issue slot 1 (second ready instruction, different from slot 0)
-  integer rs_iss_idx2;
-  reg     rs_iss_found2;
   always @(*) begin
     rs_iss_idx2   = 0;
     rs_iss_found2 = 0;
-    if (rs_iss_found) begin
+    if (rs_iss_found)
       for (i = 0; i < RS_INT; i = i + 1)
       if (!rs_iss_found2 && rs_v[i] && rs_psrdy[i] && (rs_uimm[i] || rs_ptrdy[i]) &&
-          (!rs_ibgt[i] || rs_pt3rdy[i]) && i != rs_iss_idx) begin
+            (!rs_ibgt[i] || rs_pt3rdy[i]) && i != rs_iss_idx)
+          begin
         rs_iss_idx2   = i;
         rs_iss_found2 = 1;
       end
-    end
   end
 
-  // FP issue slot 0
-  integer fp_iss_idx;
-  reg     fp_iss_found;
+  // FP issue: two ready slots
+  integer fp_iss_idx, fp_iss_idx2;
+  reg fp_iss_found, fp_iss_found2;
   always @(*) begin
     fp_iss_idx   = 0;
     fp_iss_found = 0;
@@ -767,86 +644,80 @@ module tinker_core (
       fp_iss_found = 1;
     end
   end
-
-  // FP issue slot 1
-  integer fp_iss_idx2;
-  reg     fp_iss_found2;
   always @(*) begin
     fp_iss_idx2   = 0;
     fp_iss_found2 = 0;
-    if (fp_iss_found) begin
+    if (fp_iss_found)
       for (i = 0; i < RS_FP; i = i + 1)
       if (!fp_iss_found2 && fp_v[i] && fp_psrdy[i] && fp_ptrdy[i] && i != fp_iss_idx) begin
         fp_iss_idx2   = i;
         fp_iss_found2 = 1;
       end
-    end
   end
 
-  // Gate store writes on !redirect_en to prevent wrong-path stores
+  // Store memory write control
   always @(*) begin
     if (call_pending) begin
-      lsq_mwe    = 1;
-      lsq_maddr  = call_addr;
+      lsq_mwe = 1;
+      lsq_maddr = call_addr;
       lsq_mwdata = call_wdata;
     end else if (ret_pending) begin
-      lsq_mwe    = 0;
-      lsq_maddr  = ret_addr;
+      lsq_mwe = 0;
+      lsq_maddr = ret_addr;
       lsq_mwdata = 64'd0;
     end else begin
-      lsq_mwe    = 0;
-      lsq_maddr  = lsq_h_addr;
+      lsq_mwe = 0;
+      lsq_maddr = lsq_h_addr;
       lsq_mwdata = lsq_data[lsq_head];
-      // !redirect_en prevents committed LSQ stores from writing during flush
       if (!redirect_en && lsq_cnt > 0 && lsq_v[lsq_head] && lsq_ardy[lsq_head] &&
           lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head])
         lsq_mwe = 1;
     end
   end
 
+  // ── Macro to broadcast on a CDB port (avoid code duplication) ──
+  // Used inline below for all 4 CDB ports
+
   always @(posedge clk) begin
     if (reset) begin
-      hlt    <= 0;
+      hlt <= 0;
       pc_reg <= `PC_START;
       flush_this_cycle = 0;
-      dq_v[0]      <= 0;
-      dq_v[1]      <= 0;
-      dq_v[2]      <= 0;
-      dq_v[3]      <= 0;
-      dq_cnt       <= 0;
-      redirect_en  <= 0;
-      alu_en       <= 0;
-      fpu_en       <= 0;
-      ld_done      <= 0;
+      dq_v[0] <= 0;
+      dq_v[1] <= 0;
+      dq_v[2] <= 0;
+      dq_v[3] <= 0;
+      dq_cnt <= 0;
+      redirect_en <= 0;
+      alu_en <= 0;
+      fpu_en <= 0;
+      ld_done <= 0;
       call_pending <= 0;
-      ret_pending  <= 0;
-      rob_head     <= 0;
-      rob_tail     <= 0;
-      rob_cnt      <= 0;
-      lsq_head     <= 0;
-      lsq_tail     <= 0;
-      lsq_cnt      <= 0;
-      rs_cnt       <= 0;
-      fp_cnt       <= 0;
-      fl_head      <= 0;
-      fl_tail      <= 32;
-      fl_cnt       <= 32;
-
+      ret_pending <= 0;
+      rob_head <= 0;
+      rob_tail <= 0;
+      rob_cnt <= 0;
+      lsq_head <= 0;
+      lsq_tail <= 0;
+      lsq_cnt <= 0;
+      rs_cnt <= 0;
+      fp_cnt <= 0;
+      fl_head <= 0;
+      fl_tail <= 32;
+      fl_cnt <= 32;
       for (i = 0; i < 32; i = i + 1) begin
         arch_rf[i] = 64'd0;
         rat_map[i] = i[PHYS_W-1:0];
-        prf[i]     = 64'd0;
+        prf[i] = 64'd0;
         prf_rdy[i] = 1;
       end
       arch_rf[31] = 64'd524288;
-      prf[31]     = 64'd524288;
-
+      prf[31] = 64'd524288;
       for (i = 32; i < NPHYS; i = i + 1) begin
         prf[i] = 0;
         prf_rdy[i] = 1;
       end
       for (i = 0; i < 32; i = i + 1) free_list[i] = 6'(32 + i);
-
       for (i = 0; i < ROB_SIZE; i = i + 1) begin
         rob_valid[i] = 0;
         rob_done[i]  = 0;
@@ -857,112 +728,108 @@ module tinker_core (
         lsq_v[i] = 0;
         lsq_isret[i] = 0;
       end
-
-      alu_pd_p1        <= 0;
-      alu_vs_p1        <= 0;
-      alu_imovr_p1     <= 0;
-      alu_imovi_p1     <= 0;
-      alu_ical_p1      <= 0;
-      alu_iret_p1      <= 0;
-      alu_ibr_p1       <= 0;
-      alu_ijmp_p1      <= 0;
-      alu_ibgt_p1      <= 0;
-      alu_ibrreg_p1    <= 0;
-      alu_ibrimm_p1    <= 0;
-      alu_pc_p1        <= 0;
-      alu_b_p1         <= 0;
-      fp_pd_p[0]       <= 0;
-      fp_pd_p[1]       <= 0;
-      fp_pd_p[2]       <= 0;
-      alu_vs_p         <= 0;
-      alu_pc_p         <= 0;
-      alu_ibr_p        <= 0;
-      alu_ibgt_p       <= 0;
-      alu_ijmp_p       <= 0;
-      alu_ibrreg_p     <= 0;
-      alu_ibrimm_p     <= 0;
-      alu_imovr_p      <= 0;
-      alu_imovi_p      <= 0;
-      alu_ical_p       <= 0;
-      alu_iret_p       <= 0;
-      alu_ptaken_p     <= 0;
-      alu_ptgt_p       <= 0;
-      alu_ibgt_tgt_p   <= 0;
-      alu_ibgt_tgt_p1  <= 0;
-      rf_commit_wen    <= 0;
-      rf_commit_waddr  <= 0;
-      rf_commit_data   <= 0;
-      bp_upd_en        <= 0;
-      bp_upd_pc        <= 0;
-      bp_upd_taken     <= 0;
-      bp_upd_target    <= 0;
-      dq_ptaken[0]     <= 0;
-      dq_ptaken[1]     <= 0;
-      dq_ptaken[2]     <= 0;
-      dq_ptaken[3]     <= 0;
-      dq_ptgt[0]       <= 0;
-      dq_ptgt[1]       <= 0;
-      dq_ptgt[2]       <= 0;
-      dq_ptgt[3]       <= 0;
-
-      // EXT1 resets
-      fpu_stash_v      <= 0;
-      fpu1_stash_v     <= 0;
-      alu1_en          <= 0;
-      fpu1_en          <= 0;
-      ld1_done         <= 0;
-      ld1_isret        <= 0;
-      alu1_pd_p1       <= 0;
-      alu1_vs_p1       <= 0;
-      alu1_imovr_p1    <= 0;
-      alu1_imovi_p1    <= 0;
-      alu1_ical_p1     <= 0;
-      alu1_iret_p1     <= 0;
-      alu1_ibr_p1      <= 0;
-      alu1_ijmp_p1     <= 0;
-      alu1_ibgt_p1     <= 0;
-      alu1_ibrreg_p1   <= 0;
-      alu1_ibrimm_p1   <= 0;
-      alu1_pc_p1       <= 0;
-      alu1_b_p1        <= 0;
+      alu_pd_p1 <= 0;
+      alu_vs_p1 <= 0;
+      alu_imovr_p1 <= 0;
+      alu_imovi_p1 <= 0;
+      alu_ical_p1 <= 0;
+      alu_iret_p1 <= 0;
+      alu_ibr_p1 <= 0;
+      alu_ijmp_p1 <= 0;
+      alu_ibgt_p1 <= 0;
+      alu_ibrreg_p1 <= 0;
+      alu_ibrimm_p1 <= 0;
+      alu_pc_p1 <= 0;
+      alu_b_p1 <= 0;
+      alu_ibgt_tgt_p1 <= 0;
+      alu1_pd_p1 <= 0;
+      alu1_vs_p1 <= 0;
+      alu1_imovr_p1 <= 0;
+      alu1_imovi_p1 <= 0;
+      alu1_ical_p1 <= 0;
+      alu1_iret_p1 <= 0;
+      alu1_ibr_p1 <= 0;
+      alu1_ijmp_p1 <= 0;
+      alu1_ibgt_p1 <= 0;
+      alu1_ibrreg_p1 <= 0;
+      alu1_ibrimm_p1 <= 0;
+      alu1_pc_p1 <= 0;
+      alu1_b_p1 <= 0;
       alu1_ibgt_tgt_p1 <= 0;
-      alu1_vs_p        <= 0;
-      alu1_pc_p        <= 0;
-      alu1_ibr_p       <= 0;
-      alu1_ibgt_p      <= 0;
-      alu1_ijmp_p      <= 0;
-      alu1_ibrreg_p    <= 0;
-      alu1_ibrimm_p    <= 0;
-      alu1_imovr_p     <= 0;
-      alu1_imovi_p     <= 0;
-      alu1_ical_p      <= 0;
-      alu1_iret_p      <= 0;
-      alu1_ptaken_p    <= 0;
-      alu1_ptgt_p      <= 0;
-      alu1_ibgt_tgt_p  <= 0;
-      fp1_pd_p[0]      <= 0;
-      fp1_pd_p[1]      <= 0;
-      fp1_pd_p[2]      <= 0;
+      fp_pd_p[0] <= 0;
+      fp_pd_p[1] <= 0;
+      fp_pd_p[2] <= 0;
+      fp1_pd_p[0] <= 0;
+      fp1_pd_p[1] <= 0;
+      fp1_pd_p[2] <= 0;
+      alu_vs_p <= 0;
+      alu_pc_p <= 0;
+      alu_ibr_p <= 0;
+      alu_ibgt_p <= 0;
+      alu_ijmp_p <= 0;
+      alu_ibrreg_p <= 0;
+      alu_ibrimm_p <= 0;
+      alu_imovr_p <= 0;
+      alu_imovi_p <= 0;
+      alu_ical_p <= 0;
+      alu_iret_p <= 0;
+      alu_ptaken_p <= 0;
+      alu_ptgt_p <= 0;
+      alu_ibgt_tgt_p <= 0;
+      alu1_vs_p <= 0;
+      alu1_pc_p <= 0;
+      alu1_ibr_p <= 0;
+      alu1_ibgt_p <= 0;
+      alu1_ijmp_p <= 0;
+      alu1_ibrreg_p <= 0;
+      alu1_ibrimm_p <= 0;
+      alu1_imovr_p <= 0;
+      alu1_imovi_p <= 0;
+      alu1_ical_p <= 0;
+      alu1_iret_p <= 0;
+      alu1_ptaken_p <= 0;
+      alu1_ptgt_p <= 0;
+      alu1_ibgt_tgt_p <= 0;
+      rf_commit_wen <= 0;
+      rf_commit_waddr <= 0;
+      rf_commit_data <= 0;
+      bp_upd_en <= 0;
+      bp_upd_pc <= 0;
+      bp_upd_taken <= 0;
+      bp_upd_target <= 0;
+      dq_ptaken[0] <= 0;
+      dq_ptaken[1] <= 0;
+      dq_ptaken[2] <= 0;
+      dq_ptaken[3] <= 0;
+      dq_ptgt[0] <= 0;
+      dq_ptgt[1] <= 0;
+      dq_ptgt[2] <= 0;
+      dq_ptgt[3] <= 0;
+      fpu_stash_v <= 0;
+      fpu1_stash_v <= 0;
+      alu1_en <= 0;
+      fpu1_en <= 0;
+      ld1_done <= 0;
+      ld1_isret <= 0;
 
     end else begin
 
       flush_this_cycle = 0;
       commit_happened  = 0;
       commit_freed_reg = 0;
-      redirect_en   <= 0;
-      bp_upd_en     <= 0;
-      alu_en        <= 0;
-      fpu_en        <= 0;
-      ld_done       <= 0;
-      ld_isret      <= 0;
+      redirect_en <= 0;
+      bp_upd_en <= 0;
+      alu_en <= 0;
+      fpu_en <= 0;
+      alu1_en <= 0;
+      fpu1_en <= 0;
+      ld_done <= 0;
+      ld_isret <= 0;
+      ld1_done <= 0;
+      ld1_isret <= 0;
       rf_commit_wen <= 0;
-      call_pending  <= 0;
-      ret_pending   <= 0;
-      // EXT1 defaults
-      alu1_en       <= 0;
-      fpu1_en       <= 0;
-      ld1_done      <= 0;
-      ld1_isret     <= 0;
+      call_pending <= 0;
+      ret_pending <= 0;
 
       if (call_pending) begin
         redirect_en <= 1;
@@ -973,27 +840,22 @@ module tinker_core (
         redirect_pc <= lsq_mrdata;
       end
 
-      if (!redirect_en) begin
-        for (i = 0; i < 32; i = i + 1) begin
-          if (rat_map[i] == i[PHYS_W-1:0] && prf_rdy[i]) begin
-            prf[i]    <= reg_file.registers[i];
-            arch_rf[i] <= reg_file.registers[i];
-          end
+      if (!redirect_en)
+        for (i = 0; i < 32; i = i + 1)
+        if (rat_map[i] == i[PHYS_W-1:0] && prf_rdy[i]) begin
+          prf[i] <= reg_file.registers[i];
+          arch_rf[i] <= reg_file.registers[i];
         end
-      end
 
-      // ═══════════════════════════════════════════════
-      // A. CDB BROADCAST (4 ports: c0=ALU0, c1=LD0/FPU0, c2=ALU1, c3=LD1/FPU1)
-      // ═══════════════════════════════════════════════
+      // ══ A. CDB BROADCAST ══
 
-      // ─── CDB0: ALU0 ───
+      // Helper task inlined as macro-style block for CDB0
       if (c0en && rob_valid[c0rob]) begin
-        prf[c0pd]         <= c0val;
-        prf_rdy[c0pd]     <= 1;
-        rob_done[c0rob]   <= 1;
+        prf[c0pd] <= c0val;
+        prf_rdy[c0pd] <= 1;
+        rob_done[c0rob] <= 1;
         rob_result[c0rob] <= c0val;
-        // FIX (branch_recovery): also update act_taken for brgt (alu_ibgt_p1)
-        if (alu_ibr_p1 || alu_ijmp_p1 || alu_ibgt_p1) begin
+        if (alu_ibr_p1 || alu_ijmp_p1) begin
           rob_act_taken[c0rob] <= alu_act_taken_w;
           rob_act_tgt[c0rob]   <= alu_act_tgt_w;
         end
@@ -1009,7 +871,7 @@ module tinker_core (
           end
           if (rs_ibgt[i] && !rs_pt3rdy[i] && rs_pt3[i] == c0pd) begin
             rs_pt3rdy[i] <= 1;
-            rs_imm[i]    <= c0val;
+            rs_imm[i] <= c0val;
           end
         end
         for (i = 0; i < RS_FP; i = i + 1)
@@ -1036,11 +898,11 @@ module tinker_core (
         end
       end
 
-      // ─── CDB1: LD0 / FPU0 ───
+      // CDB1: LD0 / FPU0
       if (c1en && rob_valid[c1rob]) begin
-        prf[c1pd]         <= c1val;
-        prf_rdy[c1pd]     <= 1;
-        rob_done[c1rob]   <= 1;
+        prf[c1pd] <= c1val;
+        prf_rdy[c1pd] <= 1;
+        rob_done[c1rob] <= 1;
         rob_result[c1rob] <= c1val;
         if (ld_done && ld_isret) begin
           rob_act_taken[c1rob] <= 1'b1;
@@ -1058,7 +920,7 @@ module tinker_core (
           end
           if (rs_ibgt[i] && !rs_pt3rdy[i] && rs_pt3[i] == c1pd) begin
             rs_pt3rdy[i] <= 1;
-            rs_imm[i]    <= c1val;
+            rs_imm[i] <= c1val;
           end
         end
         for (i = 0; i < RS_FP; i = i + 1)
@@ -1085,7 +947,7 @@ module tinker_core (
         end
       end
 
-      // FPU0 stash: save FPU result when ld_done steals CDB1 this cycle
+      // FPU0 stash: save result when ld_done steals CDB1
       if (ld_done && fpu_vout) begin
         fpu_stash_v   <= 1;
         fpu_stash_pd  <= fp_pd;
@@ -1093,14 +955,13 @@ module tinker_core (
         fpu_stash_rob <= fpu_tout[ROB_BITS-1:0];
       end else if (fpu_stash_v && !ld_done) fpu_stash_v <= 0;
 
-      // ─── CDB2: ALU1 ───
+      // CDB2: ALU1
       if (c2en && rob_valid[c2rob]) begin
-        prf[c2pd]         <= c2val;
-        prf_rdy[c2pd]     <= 1;
-        rob_done[c2rob]   <= 1;
+        prf[c2pd] <= c2val;
+        prf_rdy[c2pd] <= 1;
+        rob_done[c2rob] <= 1;
         rob_result[c2rob] <= c2val;
-        // FIX (branch_recovery): also update act_taken for brgt on ALU1
-        if (alu1_ibr_p1 || alu1_ijmp_p1 || alu1_ibgt_p1) begin
+        if (alu1_ibr_p1 || alu1_ijmp_p1) begin
           rob_act_taken[c2rob] <= alu1_act_taken_w;
           rob_act_tgt[c2rob]   <= alu1_act_tgt_w;
         end
@@ -1116,7 +977,7 @@ module tinker_core (
           end
           if (rs_ibgt[i] && !rs_pt3rdy[i] && rs_pt3[i] == c2pd) begin
             rs_pt3rdy[i] <= 1;
-            rs_imm[i]    <= c2val;
+            rs_imm[i] <= c2val;
           end
         end
         for (i = 0; i < RS_FP; i = i + 1)
@@ -1143,11 +1004,11 @@ module tinker_core (
         end
       end
 
-      // ─── CDB3: LD1 / FPU1 ───
+      // CDB3: LD1 / FPU1
       if (c3en && rob_valid[c3rob]) begin
-        prf[c3pd]         <= c3val;
-        prf_rdy[c3pd]     <= 1;
-        rob_done[c3rob]   <= 1;
+        prf[c3pd] <= c3val;
+        prf_rdy[c3pd] <= 1;
+        rob_done[c3rob] <= 1;
         rob_result[c3rob] <= c3val;
         if (ld1_done && ld1_isret) begin
           rob_act_taken[c3rob] <= 1'b1;
@@ -1165,7 +1026,7 @@ module tinker_core (
           end
           if (rs_ibgt[i] && !rs_pt3rdy[i] && rs_pt3[i] == c3pd) begin
             rs_pt3rdy[i] <= 1;
-            rs_imm[i]    <= c3val;
+            rs_imm[i] <= c3val;
           end
         end
         for (i = 0; i < RS_FP; i = i + 1)
@@ -1192,7 +1053,7 @@ module tinker_core (
         end
       end
 
-      // FPU1 stash: save FPU1 result when ld1_done steals CDB3 this cycle
+      // FPU1 stash
       if (ld1_done && fpu1_vout) begin
         fpu1_stash_v   <= 1;
         fpu1_stash_pd  <= fp1_pd;
@@ -1200,61 +1061,49 @@ module tinker_core (
         fpu1_stash_rob <= fpu1_tout[ROB_BITS-1:0];
       end else if (fpu1_stash_v && !ld1_done) fpu1_stash_v <= 0;
 
-      // ═══════════════════════════════════════════════
-      // B. ROB COMMIT
-      // ═══════════════════════════════════════════════
+      // ══ B. ROB COMMIT ══
       begin : commit_blk
-        reg                do_flush;
+        reg do_flush;
         reg [ROB_BITS-1:0] ch;
         do_flush = 0;
         ch = rob_head;
-
         if (rob_cnt > 0 && rob_valid[ch] && rob_done[ch]) begin
           if (rob_has_dest[ch]) begin
             arch_rf[rob_arch[ch]] <= rob_result[ch];
-            prf[rob_phys[ch]]     <= rob_result[ch];
-            rf_commit_data        <= rob_result[ch];
-            rf_commit_waddr       <= rob_arch[ch];
-            rf_commit_wen         <= 1;
+            prf[rob_phys[ch]] <= rob_result[ch];
+            rf_commit_data <= rob_result[ch];
+            rf_commit_waddr <= rob_arch[ch];
+            rf_commit_wen <= 1;
             if (rob_arch[ch] == 5'd0) reg_file.registers[0] <= rob_result[ch];
           end
-
           if (rob_is_halt[ch]) hlt <= 1;
-
           if (rob_has_dest[ch]) begin
             free_list[fl_tail] <= rob_old[ch];
-            fl_tail            <= fl_tail + 1;
-            fl_cnt             <= fl_cnt + 1;
+            fl_tail <= fl_tail + 1;
+            fl_cnt <= fl_cnt + 1;
           end
-
           if (rob_is_store[ch])
             for (i = 0; i < LSQ_SIZE; i = i + 1)
             if (lsq_v[i] && lsq_st[i] && lsq_rob[i] == ch) lsq_cmt[i] <= 1;
-
-          // FIX (branch_recovery): rob_is_branch must include brgt.
-          // This is set at dispatch time (see below). No change needed here since
-          // the fix is in the dispatch section where rob_is_branch is assigned.
           if (rob_is_branch[ch] || rob_is_jump[ch]) begin
-            bp_upd_en     <= 1;
-            bp_upd_pc     <= rob_pc[ch];
-            bp_upd_taken  <= rob_act_taken[ch];
+            bp_upd_en <= 1;
+            bp_upd_pc <= rob_pc[ch];
+            bp_upd_taken <= rob_act_taken[ch];
             bp_upd_target <= rob_act_tgt[ch];
             if (rob_pred_taken[ch] != rob_act_taken[ch] ||
                 (rob_act_taken[ch] && rob_pred_tgt[ch] != rob_act_tgt[ch])) begin
-              do_flush         = 1;
+              do_flush = 1;
               flush_this_cycle = 1;
               redirect_en <= 1;
               redirect_pc <= rob_act_taken[ch] ? rob_act_tgt[ch] : (rob_pc[ch] + 64'd4);
             end
           end
-
           rob_valid[ch] <= 0;
-          rob_done[ch]  <= 0;
-          rob_head      <= ch + 1;
-          rob_cnt       <= rob_cnt - 1;
+          rob_done[ch] <= 0;
+          rob_head <= ch + 1;
+          rob_cnt <= rob_cnt - 1;
           commit_happened  = 1;
           commit_freed_reg = rob_has_dest[ch];
-
           if (do_flush) begin
             for (i = 0; i < RS_INT; i = i + 1) rs_v[i] <= 0;
             for (i = 0; i < RS_FP; i = i + 1) fp_v[i] <= 0;
@@ -1269,19 +1118,15 @@ module tinker_core (
             end
             for (i = 0; i < 32; i = i + 1) begin
               rat_map[i] <= i[PHYS_W-1:0];
-              prf[i]     <= arch_rf[i];
+              prf[i] <= arch_rf[i];
               prf_rdy[i] <= 1;
             end
-            // arch_rf is NBA-updated same cycle; bypass with just-committed result
             if (rob_has_dest[ch]) prf[rob_arch[ch]] <= rob_result[ch];
             prf[31] <= arch_rf[31];
             for (i = 32; i < NPHYS; i = i + 1) prf_rdy[i] <= 1;
             for (i = 0; i < 32; i = i + 1) free_list[i] <= 6'(32 + i);
             fl_head  <= 0;
             fl_tail  <= 32;
-            // FIX (rename_flush_reuse): Don't add commit_freed_reg on the flush cycle.
-            // The flush resets fl_cnt to 32 directly; adding commit_freed_reg=1 here
-            // would make it 33 (overcounting), leading to invalid free-list accesses.
             fl_cnt   <= 32;
             rob_tail <= ch + 1;
             rob_cnt  <= 0;
@@ -1295,73 +1140,63 @@ module tinker_core (
             dq_v[2]  <= 0;
             dq_v[3]  <= 0;
             dq_cnt   <= 0;
-            // Mark flush so dispatch_blk skips its fl_cnt update
-            commit_freed_reg = 0;
+            commit_freed_reg = 0;  // prevent dispatch_blk from adding +1 to fl_cnt
           end
         end
-      end  // commit_blk
+      end
 
-      // ═══════════════════════════════════════════════
-      // C. LSQ EXECUTE
-      // Block during flush to prevent stale loads/stores firing
-      // ═══════════════════════════════════════════════
+      // ══ C. LSQ EXECUTE ══
       if (!redirect_en && !flush_this_cycle &&
-          lsq_cnt > 0 && lsq_v[lsq_head] && lsq_ardy[lsq_head]) begin
+          lsq_cnt>0 && lsq_v[lsq_head] && lsq_ardy[lsq_head]) begin
         if (lsq_ld[lsq_head]) begin
-          ld_done         <= 1;
-          ld_pd           <= lsq_pd[lsq_head];
-          ld_rtag         <= lsq_rob[lsq_head];
-          ld_val          <= fwd_hit ? fwd_val : lsq_mrdata;
-          ld_isret        <= lsq_isret[lsq_head];
+          ld_done <= 1;
+          ld_pd <= lsq_pd[lsq_head];
+          ld_rtag <= lsq_rob[lsq_head];
+          ld_val <= fwd_hit ? fwd_val : lsq_mrdata;
+          ld_isret <= lsq_isret[lsq_head];
           lsq_v[lsq_head] <= 0;
-          lsq_head        <= lsq_exec2 ? (lsq_head + 2) : (lsq_head + 1);
-          // Second load (lsq_head2) — only if also a load
+          lsq_head <= lsq_exec2 ? (lsq_head + 2) : (lsq_head + 1);
           if (lsq_exec2) begin
-            ld1_done         <= 1;
-            ld1_pd           <= lsq_pd[lsq_head2];
-            ld1_rtag         <= lsq_rob[lsq_head2];
-            ld1_val          <= fwd_hit2 ? fwd_val2 : lsq_mrdata2;
-            ld1_isret        <= lsq_isret[lsq_head2];
+            ld1_done <= 1;
+            ld1_pd <= lsq_pd[lsq_head2];
+            ld1_rtag <= lsq_rob[lsq_head2];
+            ld1_val <= fwd_hit2 ? fwd_val2 : lsq_mrdata2;
+            ld1_isret <= lsq_isret[lsq_head2];
             lsq_v[lsq_head2] <= 0;
           end
         end else if (lsq_st[lsq_head] && lsq_drdy[lsq_head] && lsq_cmt[lsq_head]) begin
           lsq_v[lsq_head] <= 0;
-          lsq_head        <= lsq_head + 1;
+          lsq_head <= lsq_head + 1;
         end
       end
 
-      // ═══════════════════════════════════════════════
-      // DISPATCH BLOCK
-      // ═══════════════════════════════════════════════
+      // ══ D. DISPATCH ══
       if (!redirect_en && !call_pending && !ret_pending && !flush_this_cycle) begin : dispatch_blk
         reg [PHYS_W-1:0] p0_new, p0_old, p0_ps, p0_pt;
         reg [63:0] p0_vs, p0_vt;
         reg p0_psrdy, p0_ptrdy;
         reg [ROB_BITS-1:0] p0_rob;
-        reg [  PHYS_W-1:0] p0_r31_phys;
-        reg [        63:0] p0_r31_val;
-        reg                p0_r31_rdy;
-
+        reg [PHYS_W-1:0] p0_r31_phys;
+        reg [63:0] p0_r31_val;
+        reg p0_r31_rdy;
         reg [PHYS_W-1:0] p1_new, p1_old, p1_ps, p1_pt;
         reg [63:0] p1_vs, p1_vt;
         reg p1_psrdy, p1_ptrdy;
         reg [ROB_BITS-1:0] p1_rob;
-        reg [  PHYS_W-1:0] p1_r31_phys;
-        reg [        63:0] p1_r31_val;
-        reg                p1_r31_rdy;
-
-        reg [         3:0] rs_d0_slot;
-        reg [         2:0] fp_d0_slot;
+        reg [PHYS_W-1:0] p1_r31_phys;
+        reg [63:0] p1_r31_val;
+        reg p1_r31_rdy;
+        reg [3:0] rs_d0_slot;
+        reg [2:0] fp_d0_slot;
         reg d0_used_rs, d0_used_fp;
-
-        reg [         5:0] fh;
-        reg [         6:0] fc;
+        reg [5:0] fh;
+        reg [6:0] fc;
         reg [ROB_BITS-1:0] rt;
-        reg [  ROB_BITS:0] rc;
-        reg [         3:0] rsc;
-        reg [         2:0] fpc;
-        reg [         4:0] lc;
-        reg [         2:0] lt;
+        reg [ROB_BITS:0] rc;
+        reg [3:0] rsc;
+        reg [2:0] fpc;
+        reg [4:0] lc;
+        reg [2:0] lt;
 
         fh = fl_head;
         fc = fl_cnt;
@@ -1377,13 +1212,12 @@ module tinker_core (
         d0_used_fp = 0;
 
         if (d0_en) begin
-          p0_ps    = rat_map[d0_rs];
-          p0_pt    = rat_map[d0_rt];
-          p0_vs    = prf[p0_ps];
-          p0_vt    = prf[p0_pt];
+          p0_ps = rat_map[d0_rs];
+          p0_pt = rat_map[d0_rt];
+          p0_vs = prf[p0_ps];
+          p0_vt = prf[p0_pt];
           p0_psrdy = prf_rdy[p0_ps];
           p0_ptrdy = prf_rdy[p0_pt];
-          // same-cycle CDB forwarding: CDB fires this cycle but prf_rdy not yet updated
           if (c0en) begin
             if (!p0_psrdy && p0_ps == c0pd) begin
               p0_psrdy = 1;
@@ -1427,90 +1261,84 @@ module tinker_core (
           p0_r31_phys = rat_map[5'd31];
           p0_r31_val  = prf[p0_r31_phys];
           p0_r31_rdy  = prf_rdy[p0_r31_phys];
-
           if (d0_wr && !d0_call && fc > 0) begin
             p0_new = free_list[fh];
             p0_old = rat_map[d0_rd];
-            fh     = fh + 1;
-            fc     = fc - 1;
+            fh = fh + 1;
+            fc = fc - 1;
             rat_map[d0_rd]  <= p0_new;
             prf_rdy[p0_new] <= 0;
           end else begin
             p0_new = rat_map[d0_rd];
             p0_old = rat_map[d0_rd];
           end
-
           p0_rob = rt;
           rt = rt + 1;
           rc = rc + 1;
-          rob_valid[p0_rob]      <= 1;
-          rob_done[p0_rob]       <= (!d0_wr && !d0_br && !d0_brgt && !d0_jmp) ? 1 : 0;
-          rob_arch[p0_rob]       <= d0_rd;
-          rob_phys[p0_rob]       <= p0_new;
-          rob_old[p0_rob]        <= p0_old;
-          rob_has_dest[p0_rob]   <= d0_wr;
-          rob_is_store[p0_rob]   <= d0_st;
-          rob_is_halt[p0_rob]    <= d0_hlt;
-          // FIX (branch_recovery): brgt must be treated as a branch for ROB flush purposes
-          rob_is_branch[p0_rob]  <= d0_br || d0_brgt;
-          rob_is_jump[p0_rob]    <= d0_jmp;
-          rob_pc[p0_rob]         <= dq_pc0;
+          rob_valid[p0_rob] <= 1;
+          rob_done[p0_rob] <= (!d0_wr && !d0_br && !d0_jmp) ? 1 : 0;
+          rob_arch[p0_rob] <= d0_rd;
+          rob_phys[p0_rob] <= p0_new;
+          rob_old[p0_rob] <= p0_old;
+          rob_has_dest[p0_rob] <= d0_wr;
+          rob_is_store[p0_rob] <= d0_st;
+          rob_is_halt[p0_rob] <= d0_hlt;
+          rob_is_branch[p0_rob] <= d0_br;
+          rob_is_jump[p0_rob] <= d0_jmp;
+          rob_pc[p0_rob] <= dq_pc0;
           rob_pred_taken[p0_rob] <= dq_ptaken0;
-          rob_pred_tgt[p0_rob]   <= dq_ptaken0 ? dq_ptgt0 : (dq_pc0 + 64'd4);
-          rob_act_taken[p0_rob]  <= 0;
-          rob_act_tgt[p0_rob]    <= 0;
-
+          rob_pred_tgt[p0_rob] <= dq_ptaken0 ? dq_ptgt0 : (dq_pc0 + 64'd4);
+          rob_act_taken[p0_rob] <= 0;
+          rob_act_tgt[p0_rob] <= 0;
           if (d0_mem) begin
-            lsq_v[lt]     <= 1;
-            lsq_ld[lt]    <= d0_ld;
-            lsq_st[lt]    <= d0_st;
-            lsq_ardy[lt]  <= p0_psrdy;
-            lsq_drdy[lt]  <= d0_ld ? 1'b1 : p0_ptrdy;
-            lsq_cmt[lt]   <= 0;
-            lsq_base[lt]  <= p0_vs;
-            lsq_data[lt]  <= p0_vt;
-            lsq_imm[lt]   <= d0_imm;
-            lsq_ps[lt]    <= p0_ps;
-            lsq_pt[lt]    <= p0_pt;
-            lsq_pd[lt]    <= p0_new;
-            lsq_rob[lt]   <= p0_rob;
+            lsq_v[lt] <= 1;
+            lsq_ld[lt] <= d0_ld;
+            lsq_st[lt] <= d0_st;
+            lsq_ardy[lt] <= p0_psrdy;
+            lsq_drdy[lt] <= d0_ld ? 1'b1 : p0_ptrdy;
+            lsq_cmt[lt] <= 0;
+            lsq_base[lt] <= p0_vs;
+            lsq_data[lt] <= p0_vt;
+            lsq_imm[lt] <= d0_imm;
+            lsq_ps[lt] <= p0_ps;
+            lsq_pt[lt] <= p0_pt;
+            lsq_pd[lt] <= p0_new;
+            lsq_rob[lt] <= p0_rob;
             lsq_isret[lt] <= 0;
             lt = lt + 1;
             lc = lc + 1;
           end else if (d0_call) begin
             call_pending <= 1;
-            call_tgt     <= p0_vs;
-            call_addr    <= p0_r31_val + 64'hFFFFFFFFFFFFFFF8;
-            call_wdata   <= dq_pc0 + 64'd4;
+            call_tgt <= p0_vs;
+            call_addr <= p0_r31_val + 64'hFFFFFFFFFFFFFFF8;
+            call_wdata <= dq_pc0 + 64'd4;
             rc = rc - 1;
             rt = rt - 1;
             rob_valid[p0_rob] <= 0;
           end else if (d0_ret) begin
             ret_pending <= 1;
-            ret_addr    <= p0_r31_val + 64'hFFFFFFFFFFFFFFF8;
+            ret_addr <= p0_r31_val + 64'hFFFFFFFFFFFFFFF8;
             rc = rc - 1;
             rt = rt - 1;
             rob_valid[p0_rob] <= 0;
           end else if (d0_fp) begin
             fp_d0_slot = fp_free_slot[2:0];
             d0_used_fp = 1;
-            fp_v[fp_free_slot]     <= 1;
-            fp_op[fp_free_slot]    <= d0_op;
-            fp_ps[fp_free_slot]    <= p0_ps;
-            fp_pt[fp_free_slot]    <= p0_pt;
+            fp_v[fp_free_slot] <= 1;
+            fp_op[fp_free_slot] <= d0_op;
+            fp_ps[fp_free_slot] <= p0_ps;
+            fp_pt[fp_free_slot] <= p0_pt;
             fp_psrdy[fp_free_slot] <= p0_psrdy;
             fp_ptrdy[fp_free_slot] <= p0_ptrdy;
-            fp_vs[fp_free_slot]    <= p0_vs;
-            fp_vt[fp_free_slot]    <= p0_vt;
-            fp_rob[fp_free_slot]   <= p0_rob;
+            fp_vs[fp_free_slot] <= p0_vs;
+            fp_vt[fp_free_slot] <= p0_vt;
+            fp_rob[fp_free_slot] <= p0_rob;
             fpc = fpc + 1;
           end else if (!d0_hlt) begin
             rs_d0_slot = rs_free_slot[3:0];
             d0_used_rs = 1;
             rs_v[rs_free_slot]      <= 1;
             rs_op[rs_free_slot]     <= d0_op;
-            // brgt rd,rs,rt: alu_a=rs(cmpA), alu_b=rt(cmpB), imm=rd(target)
-            // p0_ps=rat[rd], p0_pt=rat[rs], d0_rtx=rt
             rs_ps[rs_free_slot]     <= d0_brgt ? p0_pt : p0_ps;
             rs_pt[rs_free_slot]     <= d0_brgt ? rat_map[d0_rtx] : p0_pt;
             rs_psrdy[rs_free_slot]  <= d0_brgt ? p0_ptrdy : p0_psrdy;
@@ -1539,13 +1367,12 @@ module tinker_core (
         end
 
         if (d1_en) begin
-          p1_ps    = (d0_en && d0_wr && d0_rd == d1_rs) ? p0_new : rat_map[d1_rs];
-          p1_pt    = (d0_en && d0_wr && d0_rd == d1_rt) ? p0_new : rat_map[d1_rt];
-          p1_vs    = prf[p1_ps];
-          p1_vt    = prf[p1_pt];
+          p1_ps = (d0_en && d0_wr && d0_rd == d1_rs) ? p0_new : rat_map[d1_rs];
+          p1_pt = (d0_en && d0_wr && d0_rd == d1_rt) ? p0_new : rat_map[d1_rt];
+          p1_vs = prf[p1_ps];
+          p1_vt = prf[p1_pt];
           p1_psrdy = (d0_en && d0_wr && d0_rd == d1_rs) ? 1'b0 : prf_rdy[p1_ps];
           p1_ptrdy = (d0_en && d0_wr && d0_rd == d1_rt) ? 1'b0 : prf_rdy[p1_pt];
-          // same-cycle CDB forwarding for d1 (skip if d0 just renamed the reg)
           if (c0en) begin
             if (!p1_psrdy && !(d0_en && d0_wr && d0_rd == d1_rs) && p1_ps == c0pd) begin
               p1_psrdy = 1;
@@ -1589,67 +1416,63 @@ module tinker_core (
           p1_r31_phys = rat_map[5'd31];
           p1_r31_val  = prf[p1_r31_phys];
           p1_r31_rdy  = prf_rdy[p1_r31_phys];
-
           if (d1_wr && !d1_call && fc > 0) begin
             p1_new = free_list[fh];
             p1_old = (d0_en && d0_wr && d0_rd == d1_rd) ? p0_new : rat_map[d1_rd];
-            fh     = fh + 1;
-            fc     = fc - 1;
+            fh = fh + 1;
+            fc = fc - 1;
             rat_map[d1_rd]  <= p1_new;
             prf_rdy[p1_new] <= 0;
           end else begin
             p1_new = rat_map[d1_rd];
             p1_old = rat_map[d1_rd];
           end
-
           p1_rob = rt;
           rt = rt + 1;
           rc = rc + 1;
-          rob_valid[p1_rob]      <= 1;
-          rob_done[p1_rob]       <= (!d1_wr && !d1_br && !d1_brgt && !d1_jmp) ? 1 : 0;
-          rob_arch[p1_rob]       <= d1_rd;
-          rob_phys[p1_rob]       <= p1_new;
-          rob_old[p1_rob]        <= p1_old;
-          rob_has_dest[p1_rob]   <= d1_wr;
-          rob_is_store[p1_rob]   <= d1_st;
-          rob_is_halt[p1_rob]    <= d1_hlt;
-          // FIX (branch_recovery): brgt must be treated as a branch for ROB flush purposes
-          rob_is_branch[p1_rob]  <= d1_br || d1_brgt;
-          rob_is_jump[p1_rob]    <= d1_jmp;
-          rob_pc[p1_rob]         <= dq_pc1;
+          rob_valid[p1_rob] <= 1;
+          rob_done[p1_rob] <= (!d1_wr && !d1_br && !d1_jmp) ? 1 : 0;
+          rob_arch[p1_rob] <= d1_rd;
+          rob_phys[p1_rob] <= p1_new;
+          rob_old[p1_rob] <= p1_old;
+          rob_has_dest[p1_rob] <= d1_wr;
+          rob_is_store[p1_rob] <= d1_st;
+          rob_is_halt[p1_rob] <= d1_hlt;
+          rob_is_branch[p1_rob] <= d1_br;
+          rob_is_jump[p1_rob] <= d1_jmp;
+          rob_pc[p1_rob] <= dq_pc1;
           rob_pred_taken[p1_rob] <= dq_ptaken1;
-          rob_pred_tgt[p1_rob]   <= dq_ptaken1 ? dq_ptgt1 : (dq_pc1 + 64'd4);
-          rob_act_taken[p1_rob]  <= 0;
-          rob_act_tgt[p1_rob]    <= 0;
-
+          rob_pred_tgt[p1_rob] <= dq_ptaken1 ? dq_ptgt1 : (dq_pc1 + 64'd4);
+          rob_act_taken[p1_rob] <= 0;
+          rob_act_tgt[p1_rob] <= 0;
           if (d1_mem) begin
-            lsq_v[lt]     <= 1;
-            lsq_ld[lt]    <= d1_ld;
-            lsq_st[lt]    <= d1_st;
-            lsq_ardy[lt]  <= p1_psrdy;
-            lsq_drdy[lt]  <= d1_ld ? 1'b1 : p1_ptrdy;
-            lsq_cmt[lt]   <= 0;
-            lsq_base[lt]  <= p1_vs;
-            lsq_data[lt]  <= p1_vt;
-            lsq_imm[lt]   <= d1_imm;
-            lsq_ps[lt]    <= p1_ps;
-            lsq_pt[lt]    <= p1_pt;
-            lsq_pd[lt]    <= p1_new;
-            lsq_rob[lt]   <= p1_rob;
+            lsq_v[lt] <= 1;
+            lsq_ld[lt] <= d1_ld;
+            lsq_st[lt] <= d1_st;
+            lsq_ardy[lt] <= p1_psrdy;
+            lsq_drdy[lt] <= d1_ld ? 1'b1 : p1_ptrdy;
+            lsq_cmt[lt] <= 0;
+            lsq_base[lt] <= p1_vs;
+            lsq_data[lt] <= p1_vt;
+            lsq_imm[lt] <= d1_imm;
+            lsq_ps[lt] <= p1_ps;
+            lsq_pt[lt] <= p1_pt;
+            lsq_pd[lt] <= p1_new;
+            lsq_rob[lt] <= p1_rob;
             lsq_isret[lt] <= 0;
             lt = lt + 1;
             lc = lc + 1;
           end else if (d1_call) begin
             call_pending <= 1;
-            call_tgt     <= p1_vs;
-            call_addr    <= p1_r31_val + 64'hFFFFFFFFFFFFFFF8;
-            call_wdata   <= dq_pc1 + 64'd4;
+            call_tgt <= p1_vs;
+            call_addr <= p1_r31_val + 64'hFFFFFFFFFFFFFFF8;
+            call_wdata <= dq_pc1 + 64'd4;
             rc = rc - 1;
             rt = rt - 1;
             rob_valid[p1_rob] <= 0;
           end else if (d1_ret) begin
             ret_pending <= 1;
-            ret_addr    <= p1_r31_val + 64'hFFFFFFFFFFFFFFF8;
+            ret_addr <= p1_r31_val + 64'hFFFFFFFFFFFFFFF8;
             rc = rc - 1;
             rt = rt - 1;
             rob_valid[p1_rob] <= 0;
@@ -1659,15 +1482,15 @@ module tinker_core (
               fslot = 0;
               for (j = RS_FP - 1; j >= 0; j = j - 1)
               if (!fp_v[j] && (!d0_used_fp || 3'(j) != fp_d0_slot)) fslot = j[2:0];
-              fp_v[fslot]     <= 1;
-              fp_op[fslot]    <= d1_op;
-              fp_ps[fslot]    <= p1_ps;
-              fp_pt[fslot]    <= p1_pt;
+              fp_v[fslot] <= 1;
+              fp_op[fslot] <= d1_op;
+              fp_ps[fslot] <= p1_ps;
+              fp_pt[fslot] <= p1_pt;
               fp_psrdy[fslot] <= p1_psrdy;
               fp_ptrdy[fslot] <= p1_ptrdy;
-              fp_vs[fslot]    <= p1_vs;
-              fp_vt[fslot]    <= p1_vt;
-              fp_rob[fslot]   <= p1_rob;
+              fp_vs[fslot] <= p1_vs;
+              fp_vt[fslot] <= p1_vt;
+              fp_rob[fslot] <= p1_rob;
               fpc = fpc + 1;
             end
           end else if (!d1_hlt) begin
@@ -1678,8 +1501,6 @@ module tinker_core (
               if (!rs_v[j] && (!d0_used_rs || 4'(j) != rs_d0_slot)) rslot = j[3:0];
               rs_v[rslot]      <= 1;
               rs_op[rslot]     <= d1_op;
-              // brgt rd,rs,rt: alu_a=rs(cmpA), alu_b=rt(cmpB), imm=rd(target)
-              // p1_ps=rat[rd], p1_pt=rat[rs], d1_rtx=rt
               rs_ps[rslot]     <= d1_brgt ? p1_pt : p1_ps;
               rs_pt[rslot]     <= d1_brgt ? rat_map[d1_rtx] : p1_pt;
               rs_psrdy[rslot]  <= d1_brgt ? p1_ptrdy : p1_psrdy;
@@ -1716,114 +1537,99 @@ module tinker_core (
         fp_cnt   <= fpc - (fp_iss_found ? 3'd1 : 3'd0) - (fp_iss_found2 ? 3'd1 : 3'd0);
         lsq_tail <= lt;
         lsq_cnt  <= lc - (lsq_exec ? 5'd1 : 5'd0) - (lsq_exec2 ? 5'd1 : 5'd0);
-      end  // dispatch_blk
-
-      if ((call_pending || ret_pending) && !redirect_en) begin
-        if (rs_iss_found) rs_cnt <= rs_cnt - 1;
-        if (fp_iss_found) fp_cnt <= fp_cnt - 1;
-        if (lsq_exec) lsq_cnt <= lsq_cnt - 1;
       end
 
-      // ═══════════════════════════════════════════════
-      // D. FU ISSUE (dual ALU + dual FPU)
-      // ═══════════════════════════════════════════════
+      if ((call_pending || ret_pending) && !redirect_en) begin
+        if (rs_iss_found2) rs_cnt <= rs_cnt - 2;
+        else if (rs_iss_found) rs_cnt <= rs_cnt - 1;
+        if (fp_iss_found2) fp_cnt <= fp_cnt - 2;
+        else if (fp_iss_found) fp_cnt <= fp_cnt - 1;
+        if (lsq_exec2) lsq_cnt <= lsq_cnt - 2;
+        else if (lsq_exec) lsq_cnt <= lsq_cnt - 1;
+      end
+
+      // ══ E. FU ISSUE ══
       if (!redirect_en) begin
-        // ALU0 issue
         if (rs_iss_found) begin
-          alu_en           <= 1;
-          alu_op           <= rs_op[rs_iss_idx];
-          alu_a            <= rs_vs[rs_iss_idx];
-          alu_b            <= rs_uimm[rs_iss_idx] ? rs_imm[rs_iss_idx] : rs_vt[rs_iss_idx];
-          alu_rtag         <= {1'b0, rs_rob[rs_iss_idx]};
-          alu_pd           <= rob_phys[rs_rob[rs_iss_idx]];
-          alu_vs_p         <= rs_vs[rs_iss_idx];
-          alu_pc_p         <= rs_pc[rs_iss_idx];
-          alu_ibr_p        <= rs_ibr[rs_iss_idx];
-          alu_ibgt_p       <= rs_ibgt[rs_iss_idx];
-          // FIX1: Only set ibgt_tgt for actual brgt instructions
-          alu_ibgt_tgt_p   <= rs_ibgt[rs_iss_idx] ? rs_imm[rs_iss_idx] : 64'd0;
-          alu_ijmp_p       <= rs_ijmp[rs_iss_idx];
-          alu_ibrreg_p     <= rs_ibrreg[rs_iss_idx];
-          alu_ibrimm_p     <= rs_ibrimm[rs_iss_idx];
-          alu_imovr_p      <= rs_imovr[rs_iss_idx];
-          alu_imovi_p      <= rs_imovi[rs_iss_idx];
-          alu_ical_p       <= rs_ical[rs_iss_idx];
-          alu_iret_p       <= rs_iret[rs_iss_idx];
-          alu_ptaken_p     <= rs_ptaken[rs_iss_idx];
-          alu_ptgt_p       <= rs_ptgt[rs_iss_idx];
+          alu_en <= 1;
+          alu_op <= rs_op[rs_iss_idx];
+          alu_a <= rs_vs[rs_iss_idx];
+          alu_b <= rs_uimm[rs_iss_idx] ? rs_imm[rs_iss_idx] : rs_vt[rs_iss_idx];
+          alu_rtag <= {1'b0, rs_rob[rs_iss_idx]};
+          alu_pd <= rob_phys[rs_rob[rs_iss_idx]];
+          alu_vs_p <= rs_vs[rs_iss_idx];
+          alu_pc_p <= rs_pc[rs_iss_idx];
+          alu_ibr_p <= rs_ibr[rs_iss_idx];
+          alu_ibgt_p <= rs_ibgt[rs_iss_idx];
+          alu_ibgt_tgt_p <= rs_ibgt[rs_iss_idx] ? rs_imm[rs_iss_idx] : 64'd0;
+          alu_ijmp_p <= rs_ijmp[rs_iss_idx];
+          alu_ibrreg_p <= rs_ibrreg[rs_iss_idx];
+          alu_ibrimm_p <= rs_ibrimm[rs_iss_idx];
+          alu_imovr_p <= rs_imovr[rs_iss_idx];
+          alu_imovi_p <= rs_imovi[rs_iss_idx];
+          alu_ical_p <= rs_ical[rs_iss_idx];
+          alu_iret_p <= rs_iret[rs_iss_idx];
+          alu_ptaken_p <= rs_ptaken[rs_iss_idx];
+          alu_ptgt_p <= rs_ptgt[rs_iss_idx];
           rs_v[rs_iss_idx] <= 0;
         end
-
-        // ALU1 issue
-        if (rs_iss_found2) begin  // ALU1 enabled
-          alu1_en           <= 1;
-          alu1_op           <= rs_op[rs_iss_idx2];
-          alu1_a            <= rs_vs[rs_iss_idx2];
-          alu1_b            <= rs_uimm[rs_iss_idx2] ? rs_imm[rs_iss_idx2] : rs_vt[rs_iss_idx2];
-          alu1_rtag         <= {1'b0, rs_rob[rs_iss_idx2]};
-          alu1_pd           <= rob_phys[rs_rob[rs_iss_idx2]];
-          alu1_vs_p         <= rs_vs[rs_iss_idx2];
-          alu1_pc_p         <= rs_pc[rs_iss_idx2];
-          alu1_ibr_p        <= rs_ibr[rs_iss_idx2];
-          alu1_ibgt_p       <= rs_ibgt[rs_iss_idx2];
-          alu1_ibgt_tgt_p   <= rs_ibgt[rs_iss_idx2] ? rs_imm[rs_iss_idx2] : 64'd0;
-          alu1_ijmp_p       <= rs_ijmp[rs_iss_idx2];
-          alu1_ibrreg_p     <= rs_ibrreg[rs_iss_idx2];
-          alu1_ibrimm_p     <= rs_ibrimm[rs_iss_idx2];
-          alu1_imovr_p      <= rs_imovr[rs_iss_idx2];
-          alu1_imovi_p      <= rs_imovi[rs_iss_idx2];
-          alu1_ical_p       <= rs_ical[rs_iss_idx2];
-          alu1_iret_p       <= rs_iret[rs_iss_idx2];
-          alu1_ptaken_p     <= rs_ptaken[rs_iss_idx2];
-          alu1_ptgt_p       <= rs_ptgt[rs_iss_idx2];
+        if (rs_iss_found2) begin
+          alu1_en <= 1;
+          alu1_op <= rs_op[rs_iss_idx2];
+          alu1_a <= rs_vs[rs_iss_idx2];
+          alu1_b <= rs_uimm[rs_iss_idx2] ? rs_imm[rs_iss_idx2] : rs_vt[rs_iss_idx2];
+          alu1_rtag <= {1'b0, rs_rob[rs_iss_idx2]};
+          alu1_pd <= rob_phys[rs_rob[rs_iss_idx2]];
+          alu1_vs_p <= rs_vs[rs_iss_idx2];
+          alu1_pc_p <= rs_pc[rs_iss_idx2];
+          alu1_ibr_p <= rs_ibr[rs_iss_idx2];
+          alu1_ibgt_p <= rs_ibgt[rs_iss_idx2];
+          alu1_ibgt_tgt_p <= rs_ibgt[rs_iss_idx2] ? rs_imm[rs_iss_idx2] : 64'd0;
+          alu1_ijmp_p <= rs_ijmp[rs_iss_idx2];
+          alu1_ibrreg_p <= rs_ibrreg[rs_iss_idx2];
+          alu1_ibrimm_p <= rs_ibrimm[rs_iss_idx2];
+          alu1_imovr_p <= rs_imovr[rs_iss_idx2];
+          alu1_imovi_p <= rs_imovi[rs_iss_idx2];
+          alu1_ical_p <= rs_ical[rs_iss_idx2];
+          alu1_iret_p <= rs_iret[rs_iss_idx2];
+          alu1_ptaken_p <= rs_ptaken[rs_iss_idx2];
+          alu1_ptgt_p <= rs_ptgt[rs_iss_idx2];
           rs_v[rs_iss_idx2] <= 0;
         end
-
-        // FPU0 issue
         if (fp_iss_found) begin
-          fpu_en   <= 1;
-          fpu_op   <= fp_op[fp_iss_idx];
-          fpu_a    <= fp_vs[fp_iss_idx];
-          fpu_b    <= fp_vt[fp_iss_idx];
+          fpu_en <= 1;
+          fpu_op <= fp_op[fp_iss_idx];
+          fpu_a <= fp_vs[fp_iss_idx];
+          fpu_b <= fp_vt[fp_iss_idx];
           fpu_rtag <= {1'b0, fp_rob[fp_iss_idx]};
-          fpu_pd   <= rob_phys[fp_rob[fp_iss_idx]];
+          fpu_pd <= rob_phys[fp_rob[fp_iss_idx]];
           fp_v[fp_iss_idx] <= 0;
         end
-
-        // FPU1 issue
         if (fp_iss_found2) begin
-          fpu1_en   <= 1;
-          fpu1_op   <= fp_op[fp_iss_idx2];
-          fpu1_a    <= fp_vs[fp_iss_idx2];
-          fpu1_b    <= fp_vt[fp_iss_idx2];
+          fpu1_en <= 1;
+          fpu1_op <= fp_op[fp_iss_idx2];
+          fpu1_a <= fp_vs[fp_iss_idx2];
+          fpu1_b <= fp_vt[fp_iss_idx2];
           fpu1_rtag <= {1'b0, fp_rob[fp_iss_idx2]};
-          fpu1_pd   <= rob_phys[fp_rob[fp_iss_idx2]];
+          fpu1_pd <= rob_phys[fp_rob[fp_iss_idx2]];
           fp_v[fp_iss_idx2] <= 0;
         end
       end
 
-      // FPU pd pipeline
       fp_pd_p[0]  <= fpu_pd;
       fp_pd_p[1]  <= fp_pd_p[0];
       fp_pd_p[2]  <= fp_pd_p[1];
-
-      // FPU1 pd pipeline
       fp1_pd_p[0] <= fpu1_pd;
       fp1_pd_p[1] <= fp1_pd_p[0];
       fp1_pd_p[2] <= fp1_pd_p[1];
 
-      // ═══════════════════════════════════════════════
-      // F. FETCH / DECODE QUEUE (4-entry, 64-byte fetch)
-      // ═══════════════════════════════════════════════
-      // Implementation: DQ slots 0..1 are "dispatch slots" (same as original 2-entry)
-      // Slots 2..3 are "prefetch" slots that get shifted into 0..1 on the next cycle.
-      // Any branch/ctrl in slot 0 or 1 clears slots 2..3 to avoid wrong-path dispatch.
+      // ══ F. FETCH / 4-ENTRY DQ ══
       if (redirect_en || call_pending || ret_pending) begin
-        dq_v[0]      <= 0;
-        dq_v[1]      <= 0;
-        dq_v[2]      <= 0;
-        dq_v[3]      <= 0;
-        dq_cnt       <= 0;
+        dq_v[0] <= 0;
+        dq_v[1] <= 0;
+        dq_v[2] <= 0;
+        dq_v[3] <= 0;
+        dq_cnt <= 0;
         dq_ptaken[0] <= 0;
         dq_ptaken[1] <= 0;
         dq_ptaken[2] <= 0;
@@ -1831,145 +1637,134 @@ module tinker_core (
         if (redirect_en) pc_reg <= redirect_pc;
       end else if (!stall && !hlt) begin
         if (d0_en && d0_ctrl) begin
-          // Control in slot 0: shift slot 1 to slot 0, fetch new into slot 1,
-          // discard slots 2..3 (wrong-path or stale).
-          dq_v[0]      <= dq_v[1];
-          dq_i[0]      <= dq_i[1];
-          dq_pc[0]     <= dq_pc[1];
+          // Branch/ctrl in slot 0: keep slot 1, discard 2..3, fetch one more
+          dq_v[0] <= dq_v[1];
+          dq_i[0] <= dq_i[1];
+          dq_pc[0] <= dq_pc[1];
           dq_ptaken[0] <= dq_ptaken[1];
-          dq_ptgt[0]   <= dq_ptgt[1];
-          dq_v[1]      <= 1;
-          dq_i[1]      <= mem_i0;
-          dq_pc[1]     <= pc_reg;
+          dq_ptgt[0] <= dq_ptgt[1];
+          dq_v[1] <= 1;
+          dq_i[1] <= mem_i0;
+          dq_pc[1] <= pc_reg;
           dq_ptaken[1] <= bp_pred_taken0;
-          dq_ptgt[1]   <= bp_pred_target0;
-          dq_v[2]      <= 0;
-          dq_v[3]      <= 0;
-          dq_cnt       <= (dq_v[1] ? 3'd1 : 3'd0) + 3'd1;
-          pc_reg       <= bp_pred_taken0 ? bp_pred_target0 : (pc_reg + 64'd4);
+          dq_ptgt[1] <= bp_pred_target0;
+          dq_v[2] <= 0;
+          dq_v[3] <= 0;
+          dq_cnt <= (dq_v[1] ? 3'd1 : 3'd0) + 3'd1;
+          pc_reg <= bp_pred_taken0 ? bp_pred_target0 : (pc_reg + 64'd4);
         end else begin
-          // Normal path (d0_ctrl=0).
-          // Determine how many dispatched and handle accordingly.
-          // Key rule: if d1 is a control instruction, clear slots 2..3.
           begin : fetch_norm
             reg d1_is_ctrl_r;
             d1_is_ctrl_r = d1_en && (d1_jmp || d1_br || d1_call || d1_ret);
-
             if (d0_en && d1_en) begin
-              // Both dispatched.
               if (d1_is_ctrl_r) begin
-                // d1 was ctrl: must discard dq[2..3], fetch fresh
-                dq_v[2]      <= 0;
-                dq_v[3]      <= 0;
-                dq_v[0]      <= 1;
-                dq_i[0]      <= mem_i0;
-                dq_pc[0]     <= pc_reg;
+                // d1 was ctrl: discard dq[2..3], fetch fresh pair
+                dq_v[2] <= 0;
+                dq_v[3] <= 0;
+                dq_v[0] <= 1;
+                dq_i[0] <= mem_i0;
+                dq_pc[0] <= pc_reg;
                 dq_ptaken[0] <= bp_pred_taken0;
-                dq_ptgt[0]   <= bp_pred_target0;
+                dq_ptgt[0] <= bp_pred_target0;
                 if (bp_pred_taken0) begin
                   dq_v[1] <= 0;
                   dq_cnt  <= 3'd1;
                   pc_reg  <= bp_pred_target0;
                 end else begin
-                  dq_v[1]      <= 1;
-                  dq_i[1]      <= mem_i1;
-                  dq_pc[1]     <= pc_reg + 64'd4;
+                  dq_v[1] <= 1;
+                  dq_i[1] <= mem_i1;
+                  dq_pc[1] <= pc_reg + 64'd4;
                   dq_ptaken[1] <= bp_pred_taken1;
-                  dq_ptgt[1]   <= bp_pred_target1;
-                  dq_cnt       <= 3'd2;
-                  pc_reg       <= bp_pred_taken1 ? bp_pred_target1 : (pc_reg + 64'd8);
+                  dq_ptgt[1] <= bp_pred_target1;
+                  dq_cnt <= 3'd2;
+                  pc_reg <= bp_pred_taken1 ? bp_pred_target1 : (pc_reg + 64'd8);
                 end
               end else begin
-                // Normal dual-dispatch (no ctrl in either slot):
-                // Shift dq[2..3] -> dq[0..1], fetch 2 new instructions into dq[2..3]
-                dq_v[0]      <= dq_v[2];
-                dq_i[0]      <= dq_i[2];
-                dq_pc[0]     <= dq_pc[2];
+                // Normal dual: shift 2..3 -> 0..1, fetch 2 new into 2..3
+                dq_v[0] <= dq_v[2];
+                dq_i[0] <= dq_i[2];
+                dq_pc[0] <= dq_pc[2];
                 dq_ptaken[0] <= dq_ptaken[2];
-                dq_ptgt[0]   <= dq_ptgt[2];
-                dq_v[1]      <= dq_v[3];
-                dq_i[1]      <= dq_i[3];
-                dq_pc[1]     <= dq_pc[3];
+                dq_ptgt[0] <= dq_ptgt[2];
+                dq_v[1] <= dq_v[3];
+                dq_i[1] <= dq_i[3];
+                dq_pc[1] <= dq_pc[3];
                 dq_ptaken[1] <= dq_ptaken[3];
-                dq_ptgt[1]   <= dq_ptgt[3];
-                // Fill 2 new instrs into slots 2 and 3
-                dq_v[2]      <= 1;
-                dq_i[2]      <= mem_i0;
-                dq_pc[2]     <= pc_reg;
+                dq_ptgt[1] <= dq_ptgt[3];
+                dq_v[2] <= 1;
+                dq_i[2] <= mem_i0;
+                dq_pc[2] <= pc_reg;
                 dq_ptaken[2] <= bp_pred_taken0;
-                dq_ptgt[2]   <= bp_pred_target0;
+                dq_ptgt[2] <= bp_pred_target0;
                 if (bp_pred_taken0) begin
                   dq_v[3] <= 0;
                   dq_cnt  <= 3'd3;
                   pc_reg  <= bp_pred_target0;
                 end else begin
-                  dq_v[3]      <= 1;
-                  dq_i[3]      <= mem_i1;
-                  dq_pc[3]     <= pc_reg + 64'd4;
+                  dq_v[3] <= 1;
+                  dq_i[3] <= mem_i1;
+                  dq_pc[3] <= pc_reg + 64'd4;
                   dq_ptaken[3] <= bp_pred_taken1;
-                  dq_ptgt[3]   <= bp_pred_target1;
-                  dq_cnt       <= 3'd4;
-                  pc_reg       <= bp_pred_taken1 ? bp_pred_target1 : (pc_reg + 64'd8);
+                  dq_ptgt[3] <= bp_pred_target1;
+                  dq_cnt <= 3'd4;
+                  pc_reg <= bp_pred_taken1 ? bp_pred_target1 : (pc_reg + 64'd8);
                 end
               end
             end else if (d0_en) begin
-              // Only d0 dispatched (non-ctrl).
-              // Shift dq[1..3] -> dq[0..2], fetch 1 new into slot 3.
-              dq_v[0]      <= dq_v[1];
-              dq_i[0]      <= dq_i[1];
-              dq_pc[0]     <= dq_pc[1];
+              // Only d0 dispatched: shift 1..3->0..2, fetch 1 into 3
+              dq_v[0] <= dq_v[1];
+              dq_i[0] <= dq_i[1];
+              dq_pc[0] <= dq_pc[1];
               dq_ptaken[0] <= dq_ptaken[1];
-              dq_ptgt[0]   <= dq_ptgt[1];
-              dq_v[1]      <= dq_v[2];
-              dq_i[1]      <= dq_i[2];
-              dq_pc[1]     <= dq_pc[2];
+              dq_ptgt[0] <= dq_ptgt[1];
+              dq_v[1] <= dq_v[2];
+              dq_i[1] <= dq_i[2];
+              dq_pc[1] <= dq_pc[2];
               dq_ptaken[1] <= dq_ptaken[2];
-              dq_ptgt[1]   <= dq_ptgt[2];
-              dq_v[2]      <= dq_v[3];
-              dq_i[2]      <= dq_i[3];
-              dq_pc[2]     <= dq_pc[3];
+              dq_ptgt[1] <= dq_ptgt[2];
+              dq_v[2] <= dq_v[3];
+              dq_i[2] <= dq_i[3];
+              dq_pc[2] <= dq_pc[3];
               dq_ptaken[2] <= dq_ptaken[3];
-              dq_ptgt[2]   <= dq_ptgt[3];
-              dq_v[3]      <= 1;
-              dq_i[3]      <= mem_i0;
-              dq_pc[3]     <= pc_reg;
+              dq_ptgt[2] <= dq_ptgt[3];
+              dq_v[3] <= 1;
+              dq_i[3] <= mem_i0;
+              dq_pc[3] <= pc_reg;
               dq_ptaken[3] <= bp_pred_taken0;
-              dq_ptgt[3]   <= bp_pred_target0;
-              dq_cnt       <= dq_cnt;  // shifted 1 out, filled 1 in — count unchanged
-              pc_reg       <= bp_pred_taken0 ? bp_pred_target0 : (pc_reg + 64'd4);
+              dq_ptgt[3] <= bp_pred_target0;
+              dq_cnt <= dq_cnt;
+              pc_reg <= bp_pred_taken0 ? bp_pred_target0 : (pc_reg + 64'd4);
             end else begin
-              // No dispatch (d0 slot empty) — fill DQ from scratch with 2 instructions.
-              // Use same logic as original 2-entry DQ, then fill slots 2..3 extra.
-              dq_v[0]      <= 1;
-              dq_i[0]      <= mem_i0;
-              dq_pc[0]     <= pc_reg;
+              // DQ empty: fill with up to 4 instructions
+              dq_v[0] <= 1;
+              dq_i[0] <= mem_i0;
+              dq_pc[0] <= pc_reg;
               dq_ptaken[0] <= bp_pred_taken0;
-              dq_ptgt[0]   <= bp_pred_target0;
+              dq_ptgt[0] <= bp_pred_target0;
               if (bp_pred_taken0) begin
-                // predicted taken on slot 0: only fetch 1 instruction
                 dq_v[1] <= 0;
                 dq_v[2] <= 0;
                 dq_v[3] <= 0;
                 dq_cnt  <= 3'd1;
                 pc_reg  <= bp_pred_target0;
               end else begin
-                dq_v[1]      <= 1;
-                dq_i[1]      <= mem_i1;
-                dq_pc[1]     <= pc_reg + 64'd4;
+                dq_v[1] <= 1;
+                dq_i[1] <= mem_i1;
+                dq_pc[1] <= pc_reg + 64'd4;
                 dq_ptaken[1] <= bp_pred_taken1;
-                dq_ptgt[1]   <= bp_pred_target1;
-                dq_v[2]      <= 1;
-                dq_i[2]      <= mem_i2;
-                dq_pc[2]     <= pc_reg + 64'd8;
+                dq_ptgt[1] <= bp_pred_target1;
+                dq_v[2] <= 1;
+                dq_i[2] <= mem_i2;
+                dq_pc[2] <= pc_reg + 64'd8;
                 dq_ptaken[2] <= 0;
-                dq_ptgt[2]   <= 0;
-                dq_v[3]      <= 1;
-                dq_i[3]      <= mem_i3;
-                dq_pc[3]     <= pc_reg + 64'd12;
+                dq_ptgt[2] <= 0;
+                dq_v[3] <= 1;
+                dq_i[3] <= mem_i3;
+                dq_pc[3] <= pc_reg + 64'd12;
                 dq_ptaken[3] <= 0;
-                dq_ptgt[3]   <= 0;
-                dq_cnt       <= bp_pred_taken1 ? 3'd2 : 3'd4;
-                pc_reg       <= bp_pred_taken1 ? bp_pred_target1 : (pc_reg + 64'd16);
+                dq_ptgt[3] <= 0;
+                dq_cnt <= bp_pred_taken1 ? 3'd2 : 3'd4;
+                pc_reg <= bp_pred_taken1 ? bp_pred_target1 : (pc_reg + 64'd16);
               end
             end
           end
