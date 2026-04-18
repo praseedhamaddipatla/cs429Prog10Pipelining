@@ -213,7 +213,7 @@ module tinker_core (
 
   wire       stall = rob_full || rs_full || fp_full || lsq_full;
   wire       d0_en = dq_v0 && !stall;
-  wire       d0_ctrl = d0_jmp || d0_br || d0_call || d0_ret;
+  wire       d0_ctrl = d0_jmp || d0_br || d0_brgt || d0_call || d0_ret;
   wire       d1_en = dq_v1 && !stall && !d0_hlt && !(d0_en && d0_ctrl);
 
   // ─────────────────── ALU0 pipeline ───────────────────
@@ -635,38 +635,33 @@ module tinker_core (
   // Simpler: among all matching stores, pick the one whose lsq position is "newest"
   // (closest before lsq_head in circular order). We track this by finding the match
   // with the largest "age distance" from lsq_head going backwards.
-  // Actually simplest correct approach: among matching stores, pick the one with the
-  // ROB tag that is "newest" = largest (mod ROB_SIZE) relative to rob_head.
-  // We implement: iterate all, keep the one whose ROB tag is "most recent" (smallest
-  // distance from rob_tail going backwards = closest to the load in program order).
+  // Store-to-load forwarding for lsq_head.
+  // FIX (lsq_forwarding_order): Must pick the MOST RECENT store that is OLDER than
+  // the load (in program order). "Older" means smaller circular distance from rob_head.
+  // Among all older matching stores, pick the one with the LARGEST distance from rob_head
+  // (= most recently dispatched store before the load = the one whose value takes effect).
+  // load_dist = (lsq_rob[lsq_head] - rob_head) mod ROB_SIZE
+  // store is older iff (lsq_rob[sf] - rob_head) mod ROB_SIZE < load_dist
   integer sf;
   reg fwd_hit;
   reg [63:0] fwd_val;
   reg [ROB_BITS-1:0] fwd_best_rob;
   always @(*) begin
-    fwd_hit     = 0;
-    fwd_val     = 64'd0;
+    fwd_hit      = 0;
+    fwd_val      = 64'd0;
     fwd_best_rob = 0;
     for (sf = 0; sf < LSQ_SIZE; sf = sf + 1) begin
       if (lsq_v[sf] && lsq_st[sf] && lsq_ardy[sf] && lsq_drdy[sf] &&
+            sf != lsq_head &&
             (lsq_base[sf] + lsq_imm[sf] == lsq_h_addr)) begin
-        if (!fwd_hit) begin
-          // First match
-          fwd_hit      = 1;
-          fwd_val      = lsq_data[sf];
-          fwd_best_rob = lsq_rob[sf];
-        end else begin
-          // Pick most recent: the ROB tag that is "newer" = closer to rob_tail.
-          // "Newer" means the tag is greater in circular sense relative to rob_head.
-          // dist_new = (candidate_rob - rob_head) mod ROB_SIZE
-          // dist_best = (fwd_best_rob - rob_head) mod ROB_SIZE
-          // If dist_new > dist_best => candidate is newer (further from head) => pick it.
-          // But we want the one OLDER than the load but NEWEST among stores.
-          // Since all matching stores are valid and older than the load in program order,
-          // we pick the one with the largest ROB tag distance from rob_head
-          // (i.e., closest to the load = most recent store).
-          if (((lsq_rob[sf] - rob_head) & {ROB_BITS{1'b1}}) >
-              ((fwd_best_rob - rob_head) & {ROB_BITS{1'b1}})) begin
+        // Check store is older than load: store_dist < load_dist (both mod ROB_SIZE)
+        if (((lsq_rob[sf]       - rob_head) & {ROB_BITS{1'b1}}) <
+            ((lsq_rob[lsq_head] - rob_head) & {ROB_BITS{1'b1}})) begin
+          // Store is older than load. Is it more recent than our best match?
+          if (!fwd_hit ||
+              ((lsq_rob[sf] - rob_head) & {ROB_BITS{1'b1}}) >
+              ((fwd_best_rob  - rob_head) & {ROB_BITS{1'b1}})) begin
+            fwd_hit      = 1;
             fwd_val      = lsq_data[sf];
             fwd_best_rob = lsq_rob[sf];
           end
@@ -675,7 +670,8 @@ module tinker_core (
     end
   end
 
-  // FIX (lsq_forwarding_order): Store-to-load forwarding for lsq_head2.
+  // Store-to-load forwarding for lsq_head2.
+  // FIX (lsq_forwarding_order): Same logic - only forward from stores older than the load.
   integer sf2;
   reg fwd_hit2;
   reg [63:0] fwd_val2;
@@ -686,14 +682,14 @@ module tinker_core (
     fwd_best_rob2 = 0;
     for (sf2 = 0; sf2 < LSQ_SIZE; sf2 = sf2 + 1) begin
       if (lsq_v[sf2] && lsq_st[sf2] && lsq_ardy[sf2] && lsq_drdy[sf2] &&
+            sf2 != lsq_head2 &&
             (lsq_base[sf2] + lsq_imm[sf2] == lsq_maddr2)) begin
-        if (!fwd_hit2) begin
-          fwd_hit2      = 1;
-          fwd_val2      = lsq_data[sf2];
-          fwd_best_rob2 = lsq_rob[sf2];
-        end else begin
-          if (((lsq_rob[sf2] - rob_head) & {ROB_BITS{1'b1}}) >
-              ((fwd_best_rob2 - rob_head) & {ROB_BITS{1'b1}})) begin
+        if (((lsq_rob[sf2]        - rob_head) & {ROB_BITS{1'b1}}) <
+            ((lsq_rob[lsq_head2]  - rob_head) & {ROB_BITS{1'b1}})) begin
+          if (!fwd_hit2 ||
+              ((lsq_rob[sf2]   - rob_head) & {ROB_BITS{1'b1}}) >
+              ((fwd_best_rob2  - rob_head) & {ROB_BITS{1'b1}})) begin
+            fwd_hit2      = 1;
             fwd_val2      = lsq_data[sf2];
             fwd_best_rob2 = lsq_rob[sf2];
           end
